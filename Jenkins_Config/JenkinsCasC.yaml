@@ -1,0 +1,233 @@
+# Dependency:
+# Replace following placeholder
+# <ENV_ALB_DNS> - ALB DNS name of Jenkins Master
+# Ec2KeyPairID - EkyPair ID with which Jenkins master and Agent will be launched
+# AWS_REGION - AWS Region in which Jenkins and it's agent is running
+# AL2_X86_64_AMI_ID - AL2 AMI ID for x86_64
+# AL2_ARM64_AMI_ID - AL2 AMI ID for arm64
+# JENKINS_AGENT_INSTANCE_PROFILE - Instance profile to be used with Jenkins Agent
+# JENKINS_AGENT_SG - SG that Jenkins Agent will use
+# JENKINS_AGENT_SUBNETS - Subnets in which Jenkins Agent will launched
+# The plugin will default to looking for a single config file in $JENKINS_HOME/jenkins.yaml
+# Ref: https://www.codurance.com/publications/2019/05/30/accessing-and-dumping-jenkins-credentials
+credentials:
+  system:
+    domainCredentials:
+    - credentials:
+      - string:
+          description: 'Github Token - For Jenkins Integration'
+          id: 'GitHub-Access-Token'
+          scope: GLOBAL
+          secret: '${GitHub-Access-Token}'
+      - basicSSHUserPrivateKey:
+          id: 'GitRepo_Integration_Key'
+          privateKeySource:
+            directEntry:
+              privateKey: '${GitRepo-Integration-Key}'
+          scope: GLOBAL
+          username: 'git'
+          description: 'GitRepo Integration Key - santosh-at-github'
+      - basicSSHUserPrivateKey:
+          description: 'EC2 Ubuntu Agent ip-172-31-25-34'
+          id: 'Ubuntu-agent-ip-172-31-25-34'
+          privateKeySource:
+            directEntry:
+              privateKey: '${Node-Integration-Key}'
+          scope: GLOBAL
+          username: 'ubuntu'
+      - basicSSHUserPrivateKey:
+          description: 'EC2 Instance Key'
+          id: 'EC2-Instance-Key'
+          privateKeySource:
+            directEntry:
+              privateKey: '${/ec2/keypair/Ec2KeyPairID}'
+          scope: GLOBAL
+          username: 'ec2-user'
+      - usernamePassword:
+          description: "AWS IAM-Admin Credential"
+          id: "IAM-Admin-Credential"
+          scope: GLOBAL
+          username: ${IAM-Admin-Access-Key-ID}
+          password: ${IAM-User-Secret-Access-Key}
+jenkins:
+  agentProtocols:
+  - 'JNLP4-connect'
+  - 'Ping'
+  authorizationStrategy:
+    loggedInUsersCanDoAnything:
+      allowAnonymousRead: false
+  # Cloud config for launching onDemand Jenkins Agents
+  clouds:
+  - amazonEC2:
+      instanceCapStr: "5"
+      name: "Amazon EC2 workers"
+      region: "AWS_REGION"
+      sshKeysCredentialsId: "EC2-Instance-Key"
+      templates:
+      - ami: "AL2_X86_64_AMI_ID"
+        amiType:
+          unixData:
+            sshPort: "22"
+        associatePublicIp: false
+        connectBySSHProcess: true
+        connectionStrategy: PRIVATE_IP
+        deleteRootOnTermination: false
+        description: "Linux x86_64 AL2 AMI"
+        ebsEncryptRootVolume: DEFAULT
+        ebsOptimized: false
+        hostKeyVerificationStrategy: 'OFF'
+        iamInstanceProfile: "JENKINS_AGENT_INSTANCE_PROFILE"
+        idleTerminationMinutes: "30"
+        instanceCapStr: "5"
+        javaPath: "java"
+        labelString: "aws_ec2_linux_al2_x86_64"
+        maxTotalUses: -1
+        metadataEndpointEnabled: true
+        metadataHopsLimit: 1
+        metadataSupported: true
+        metadataTokensRequired: true
+        minimumNumberOfInstances: 0
+        minimumNumberOfSpareInstances: 0
+        mode: EXCLUSIVE
+        monitoring: false
+        numExecutors: 14
+        remoteAdmin: "ec2-user"
+        remoteFS: "./jenkinsAgent"
+        securityGroups: "JENKINS_AGENT_SG"
+        stopOnTerminate: false
+        subnetId: "JENKINS_AGENT_SUBNETS"
+        t2Unlimited: false
+        tags:
+        - name: "JenkinsAgent"
+          value: "True"
+        tenancy: Default
+        type: C5Xlarge
+        useEphemeralDevices: false
+        userData: |-
+          #!/bin/bash
+          yum install docker git jq -y
+          usermod -aG docker ec2-user
+          systemctl enable docker --now
+          mkdir /home/ec2-user/.ssh
+          cat <<EOF > /home/ec2-user/.ssh/config
+          Host *
+              StrictHostKeyChecking no
+          EOF
+          chown -R ec2-user:ec2-user /home/ec2-user/.ssh
+          chmod 700 /home/ec2-user/.ssh
+      - ami: "AL2_ARM64_AMI_ID"
+        amiType:
+          unixData:
+            sshPort: "22"
+        associatePublicIp: false
+        connectBySSHProcess: true
+        connectionStrategy: PRIVATE_IP
+        deleteRootOnTermination: false
+        description: "Linux arm64 AL2 AMI"
+        ebsEncryptRootVolume: DEFAULT
+        ebsOptimized: false
+        hostKeyVerificationStrategy: 'OFF'
+        iamInstanceProfile: "JENKINS_AGENT_INSTANCE_PROFILE"
+        idleTerminationMinutes: "30"
+        instanceCapStr: "5"
+        javaPath: "java"
+        labelString: "aws_ec2_linux_al2_arm64"
+        maxTotalUses: -1
+        metadataEndpointEnabled: true
+        metadataHopsLimit: 1
+        metadataSupported: true
+        metadataTokensRequired: true
+        minimumNumberOfInstances: 0
+        minimumNumberOfSpareInstances: 0
+        mode: EXCLUSIVE
+        monitoring: false
+        numExecutors: 5
+        remoteAdmin: "ec2-user"
+        remoteFS: "./jenkinsAgent"
+        securityGroups: "JENKINS_AGENT_SG"
+        stopOnTerminate: false
+        subnetId: "JENKINS_AGENT_SUBNETS"
+        t2Unlimited: false
+        tags:
+        - name: "JenkinsAgent"
+          value: "True"
+        tenancy: Default
+        type: C6gXlarge
+        useEphemeralDevices: false
+        userData: |-
+          #!/bin/bash
+          yum install docker git jq -y
+          usermod -aG docker ec2-user
+          systemctl enable docker --now
+          mkdir /home/ec2-user/.ssh
+          cat <<EOF > /home/ec2-user/.ssh/config
+          Host *
+              StrictHostKeyChecking no
+          EOF
+          chown -R ec2-user:ec2-user /home/ec2-user/.ssh
+          chmod 700 /home/ec2-user/.ssh
+      useInstanceProfileForCredentials: true
+  crumbIssuer:
+    standard:
+      excludeClientIPFromCrumb: false
+  disableRememberMe: false
+  # globalNodeProperties:
+  # - envVars:
+  #     env:
+  #     - key: ALB_DNS
+  #       value: <ENV_ALB_DNS>
+  securityRealm:
+    local:
+      allowsSignup: false
+      enableCaptcha: false
+      users:
+      - id: 'admin'
+        name: 'admin'
+        password: ${Jenkins-Password}
+        properties:
+        - 'myView'
+        - preferredProvider:
+            providerId: 'default'
+        - timezone:
+            timeZoneName: 'Asia/Kolkata'
+        - mailer:
+            emailAddress: 'ec2-jenkins@ec2.com'
+        - 'apiToken'
+  slaveAgentPort: 3622
+  updateCenter:
+    sites:
+    - id: 'default'
+      url: 'https://updates.jenkins.io/update-center.json'
+  views:
+  - all:
+      name: 'all'
+  viewsTabBar: 'standard'
+security:
+  gitHostKeyVerificationConfiguration:
+    sshHostKeyVerificationStrategy: 'noHostKeyVerificationStrategy'
+  sSHD:
+    port: -1
+unclassified:
+  buildDiscarders:
+    configuredBuildDiscarders:
+    - 'jobBuildDiscarder'
+  buildStepOperation:
+    enabled: false
+  gitHubConfiguration:
+    apiRateLimitChecker: ThrottleForNormalize
+  gitHubPluginConfig:
+    configs:
+    - credentialsId: 'GitHub-Access-Token'
+      manageHooks: false
+      name: 'myGitHub'
+    hookUrl: 'http://<ENV_ALB_DNS>/github-webhook/'
+  location:
+    adminAddress: 'address not configured yet <nobody@nowhere>'
+    url: 'http://<ENV_ALB_DNS>/'
+  pollSCM:
+    pollingThreadCount: 10
+tool:
+  git:
+    installations:
+    - home: 'git'
+      name: 'Default'

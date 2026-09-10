@@ -1,0 +1,729 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description: >
+  Graviton vs x86 demo for the GadgetsOnline .NET application. Single stack:
+  ECR repository, IAM roles, security groups, a build host, and two application
+  hosts (one Intel, one Graviton) of matched vCPU count. Uses the account's
+  default VPC so no networking resources are created. Replaces the EKS/Jenkins
+  stack set under CFN_Yaml/ for demo purposes; those templates are untouched.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: { default: Network }
+        Parameters: [VpcId, SubnetId, SecondSubnetId, AdminCidr]
+      - Label: { default: Instance sizing }
+        Parameters: [X86InstanceType, ArmInstanceType, BuildInstanceType]
+      - Label: { default: AMIs (leave as-is to track latest Amazon Linux 2023) }
+        Parameters: [X86AmiId, ArmAmiId]
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: Default VPC of this account/region.
+
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: >
+      A public subnet in the VPC above. All three instances land in this one
+      subnet, so the demo comparison shares an availability zone and the result
+      cannot be blamed on placement.
+
+  SecondSubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: >
+      A public subnet in a DIFFERENT availability zone. Required only because an
+      Application Load Balancer must span two zones; no instance is placed here.
+
+  AdminCidr:
+    Type: String
+    Default: ''
+    AllowedPattern: '^$|^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$'
+    Description: >
+      CIDR permitted to reach the load balancer. Leave EMPTY (the default) and
+      the load balancer accepts NOTHING -- it exists but is unreachable, so the
+      stack is never publicly exposed by accident. Reach the hosts through
+      Session Manager port forwarding in that case.
+
+      Set your own address (for example 15.248.5.8/32) to use the load balancer
+      URLs. Never 0.0.0.0/0: an open inbound rule on a public load balancer is
+      exactly what the account's detective controls look for.
+
+  X86InstanceType:
+    Type: String
+    Default: c6i.xlarge
+    Description: Intel/AMD application host. 4 vCPU at xlarge.
+
+  ArmInstanceType:
+    Type: String
+    Default: c7g.xlarge
+    Description: AWS Graviton application host. Must match X86InstanceType vCPU count for a fair comparison.
+
+  BuildInstanceType:
+    Type: String
+    Default: c7g.large
+    Description: >
+      Build host. Compiles once to architecture-neutral IL, so its own
+      architecture does not affect the images it produces.
+
+  X86AmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+
+  ArmAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64
+
+Conditions:
+  # An inbound rule is created only when AdminCidr is explicitly set. Empty means
+  # the application hosts accept no inbound traffic whatsoever.
+  HasAdminCidr: !Not [!Equals [!Ref AdminCidr, '']]
+
+Resources:
+
+  # ---------------------------------------------------------------------------
+  # Container registry
+  # ---------------------------------------------------------------------------
+  EcrRepository:
+    Type: AWS::ECR::Repository
+    # Retained so a stack delete cannot destroy pushed images mid-demo; delete
+    # the repository by hand when the demo is finished.
+    UpdateReplacePolicy: Retain
+    DeletionPolicy: Retain
+    Properties:
+      RepositoryName: gadgetsonline-graviton-demo
+      ImageTagMutability: MUTABLE
+      ImageScanningConfiguration:
+        ScanOnPush: false
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Keep only the 10 most recent images.",
+                "selection": {
+                  "tagStatus": "any",
+                  "countType": "imageCountMoreThan",
+                  "countNumber": 10
+                },
+                "action": { "type": "expire" }
+              }
+            ]
+          }
+
+  # ---------------------------------------------------------------------------
+  # IAM — one role per job, each scoped to the single repository above
+  # ---------------------------------------------------------------------------
+  BuildHostRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        # Session Manager only. No inbound SSH is opened anywhere in this stack.
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: EcrPushPull
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: "*"   # not resource-scopable
+              - Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:BatchGetImage
+                  - ecr:CompleteLayerUpload
+                  - ecr:DescribeImages
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:InitiateLayerUpload
+                  - ecr:PutImage
+                  - ecr:UploadLayerPart
+                Resource: !GetAtt EcrRepository.Arn
+        - PolicyName: DeployToAppHosts
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # Lets the build host redeploy both application hosts without SSH.
+              - Effect: Allow
+                Action: [ssm:SendCommand, ssm:GetCommandInvocation, ssm:ListCommandInvocations]
+                Resource: "*"
+              - Effect: Allow
+                Action: ec2:DescribeInstances
+                Resource: "*"
+
+  AppHostRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: EcrPullOnly
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:BatchGetImage
+                  - ecr:GetDownloadUrlForLayer
+                Resource: !GetAtt EcrRepository.Arn
+
+  BuildHostProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref BuildHostRole]
+
+  AppHostProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref AppHostRole]
+
+  # ---------------------------------------------------------------------------
+  # Security groups
+  # ---------------------------------------------------------------------------
+  AppSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      # A security group's description is immutable in AWS: editing this string
+      # forces CloudFormation to replace the group, which in turn cycles the
+      # instances attached to it. Left exactly as first deployed -- the inbound
+      # rules below are what actually changed.
+      GroupDescription: GadgetsOnline demo application hosts - HTTP only, no SSH.
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: Outbound for ECR pulls and Session Manager.
+      Tags:
+        - { Key: Name, Value: gadgetsonline-demo-app }
+
+  BuildSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: GadgetsOnline demo build host - no inbound, Session Manager only.
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: Outbound for ECR pushes, package installs and Session Manager.
+      Tags:
+        - { Key: Name, Value: gadgetsonline-demo-build }
+
+  # ---------------------------------------------------------------------------
+  # Load balancer
+  #
+  # One balancer, three listeners on three ports -- deliberately NOT path-based
+  # routing. The application emits absolute paths (/Content/Site.css,
+  # /Scripts/jquery-1.4.4.min.js, and the readout polls /Recommendations/Status),
+  # so serving it under a /x86/ prefix would 404 every asset and break the
+  # button. A port per backend needs no rewriting and no application change.
+  #
+  #   :8081 -> Intel host        :8082 -> Graviton host       :8080 -> Jenkins
+  # ---------------------------------------------------------------------------
+  LoadBalancerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      # Single-line and plain on purpose. A YAML folded block (>) appends a
+      # trailing newline, and EC2 rejects a security group description that
+      # contains one -- the whole stack update rolls back on it.
+      GroupDescription: GadgetsOnline demo load balancer - inbound only from AdminCidr.
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: To the application hosts.
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          CidrIp: 0.0.0.0/0
+          Description: To Jenkins on the build host.
+      Tags:
+        - { Key: Name, Value: gadgetsonline-demo-alb }
+
+  # No AdminCidr means no rule here, so the balancer resolves but refuses every
+  # connection. Fail-safe by construction rather than by remembering to check.
+  LoadBalancerIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: HasAdminCidr
+    Properties:
+      GroupId: !Ref LoadBalancerSecurityGroup
+      IpProtocol: tcp
+      FromPort: 8080
+      ToPort: 8082
+      CidrIp: !Ref AdminCidr
+      Description: Demo ports 8080-8082 from the admin CIDR only.
+
+  # The application hosts accept traffic from the balancer only -- never from a
+  # CIDR, so there is no path from the internet to port 80 on an instance.
+  AppFromLoadBalancer:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref AppSecurityGroup
+      IpProtocol: tcp
+      FromPort: 80
+      ToPort: 80
+      SourceSecurityGroupId: !Ref LoadBalancerSecurityGroup
+      Description: Application HTTP from the load balancer.
+
+  # The benchmark pipeline runs on the build host and drives both application
+  # hosts over HTTP. Without this rule those requests are dropped by the
+  # application security group, which admits the load balancer only -- the
+  # failure looks like a timeout rather than a refusal, which cost time to
+  # diagnose once already.
+  AppFromBuildHost:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref AppSecurityGroup
+      IpProtocol: tcp
+      FromPort: 80
+      ToPort: 80
+      SourceSecurityGroupId: !Ref BuildSecurityGroup
+      Description: Application HTTP from the build host, for the benchmark pipeline.
+
+  JenkinsFromLoadBalancer:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref BuildSecurityGroup
+      IpProtocol: tcp
+      FromPort: 8080
+      ToPort: 8080
+      SourceSecurityGroupId: !Ref LoadBalancerSecurityGroup
+      Description: Jenkins UI from the load balancer.
+
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: gadgetsonline-demo
+      Type: application
+      # Internet-facing so the operator can open a real URL, but reachable only
+      # from AdminCidr via the security group above.
+      Scheme: internet-facing
+      Subnets: [!Ref SubnetId, !Ref SecondSubnetId]
+      SecurityGroups: [!Ref LoadBalancerSecurityGroup]
+      Tags:
+        - { Key: Name, Value: gadgetsonline-demo }
+
+  X86TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: gadgetsonline-x86
+      VpcId: !Ref VpcId
+      Protocol: HTTP
+      Port: 80
+      TargetType: instance
+      # One instance per group on purpose. The demo must reach a NAMED processor,
+      # not whichever host a balancer happens to choose.
+      Targets:
+        - Id: !Ref X86AppHost
+          Port: 80
+      HealthCheckPath: /
+      HealthCheckIntervalSeconds: 10
+      HealthyThresholdCount: 2
+      Matcher: { HttpCode: 200-399 }
+      TargetGroupAttributes:
+        # Sticky sessions off: each group holds one target, so there is nothing
+        # to stick to, and the benchmark must not be affected by a cookie.
+        - { Key: deregistration_delay.timeout_seconds, Value: '10' }
+
+  ArmTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: gadgetsonline-arm64
+      VpcId: !Ref VpcId
+      Protocol: HTTP
+      Port: 80
+      TargetType: instance
+      Targets:
+        - Id: !Ref ArmAppHost
+          Port: 80
+      HealthCheckPath: /
+      HealthCheckIntervalSeconds: 10
+      HealthyThresholdCount: 2
+      Matcher: { HttpCode: 200-399 }
+      TargetGroupAttributes:
+        - { Key: deregistration_delay.timeout_seconds, Value: '10' }
+
+  JenkinsTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: gadgetsonline-jenkins
+      VpcId: !Ref VpcId
+      Protocol: HTTP
+      Port: 8080
+      TargetType: instance
+      Targets:
+        - Id: !Ref BuildHost
+          Port: 8080
+      HealthCheckPath: /login
+      HealthCheckIntervalSeconds: 30
+      HealthyThresholdCount: 2
+      # Jenkins answers /login with 200 once started, and 403 while still
+      # unlocking, so the range is deliberately wide.
+      Matcher: { HttpCode: 200-403 }
+      TargetGroupAttributes:
+        - { Key: deregistration_delay.timeout_seconds, Value: '10' }
+
+  X86Listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Protocol: HTTP
+      Port: 8081
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref X86TargetGroup
+
+  ArmListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Protocol: HTTP
+      Port: 8082
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref ArmTargetGroup
+
+  JenkinsListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Protocol: HTTP
+      Port: 8080
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref JenkinsTargetGroup
+
+  # ---------------------------------------------------------------------------
+  # Build host — Docker, buildx, git, .NET not required (build happens in Docker)
+  # ---------------------------------------------------------------------------
+  BuildHost:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref BuildInstanceType
+      ImageId: !Ref ArmAmiId
+      IamInstanceProfile: !Ref BuildHostProfile
+      SubnetId: !Ref SubnetId
+      SecurityGroupIds: [!Ref BuildSecurityGroup]
+      BlockDeviceMappings:
+        # The AL2023 default of 8 GiB does not fit this host: the Jenkins image
+        # and its home volume, a BuildKit worker, the .NET SDK layer (~1.2 GiB
+        # extracted), an aspnet runtime layer per target architecture, and the
+        # publish output of each build. At 8 GiB the build failed partway with
+        # MSB3021 "No space left on device", after minutes of healthy output.
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: 20
+            VolumeType: gp3
+            DeleteOnTermination: true
+            Encrypted: true
+      MetadataOptions:
+        # IMDSv2 only. Services/Platform.cs already speaks v2 (PUT for a token,
+        # then GET with the token header); this refuses v1 at the instance so the
+        # posture does not depend on an account-level default.
+        HttpEndpoint: enabled
+        HttpTokens: required
+        # The application runs in a container, which reaches 169.254.169.254 over
+        # the docker bridge -- two hops, not one. At the default limit of 1 the
+        # token request is dropped and the readout loses the instance type, which
+        # is the label identifying which processor produced a result.
+        HttpPutResponseHopLimit: 2
+      Tags:
+        - { Key: Name, Value: gadgetsonline-demo-build }
+        - { Key: Role, Value: build }
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euxo pipefail
+          exec > >(tee /var/log/user-data.log) 2>&1
+
+          dnf install -y docker git jq
+          systemctl enable --now docker
+          usermod -aG docker ec2-user
+
+          # The docker package on AL2023 ships without the buildx CLI plugin.
+          # buildx is what produces a multi-architecture manifest list from a
+          # single build invocation, so install it explicitly.
+          BUILDX_VERSION=v0.17.1
+          mkdir -p /usr/libexec/docker/cli-plugins
+          curl -fsSL \
+            "https://github.com/docker/buildx/releases/download/$BUILDX_VERSION/buildx-$BUILDX_VERSION.linux-arm64" \
+            -o /usr/libexec/docker/cli-plugins/docker-buildx
+          chmod +x /usr/libexec/docker/cli-plugins/docker-buildx
+
+          # A docker-container driver builder, with the accepted platforms
+          # DECLARED rather than inferred from binfmt handlers. Nothing
+          # cross-architecture is ever executed -- the compile stage is pinned to
+          # this host's architecture by --platform=$BUILDPLATFORM in the
+          # Dockerfile, and the target stage only does COPY and metadata -- so
+          # declaring the platform is sufficient and avoids binfmt entirely.
+          #
+          # binfmt was tried first and is a trap here: registrations are lost on
+          # every reboot, and since Linux 5.19 they are mount-namespace aware, so
+          # one made inside a container or a systemd service never appears on the
+          # host at all.
+          sudo -u ec2-user docker buildx create --name demo --driver docker-container \
+            --platform linux/amd64,linux/arm64 --use
+          sudo -u ec2-user docker buildx inspect --bootstrap
+
+          # Stack facts the build script reads, so nothing is hardcoded in git.
+          cat > /etc/graviton-demo.env <<PROFILE
+          ECR_REPO=${EcrRepository.RepositoryUri}
+          ECR_REGISTRY=${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com
+          DEMO_REGION=${AWS::Region}
+          X86_INSTANCE_ID=${X86AppHost}
+          ARM_INSTANCE_ID=${ArmAppHost}
+          PROFILE
+          echo 'set -a; . /etc/graviton-demo.env; set +a' > /etc/profile.d/graviton-demo.sh
+
+          # Jenkins, as a container on this same host. Deliberately NOT the
+          # CFN_Yaml/JenkinsEnv.yaml topology (361 lines of ALB, EFS and
+          # Configuration-as-Code): the demo needs a pipeline to point at, not a
+          # production controller. Mounted docker socket so a job can build with
+          # the host's buildx, and the host source tree so a job can run the
+          # pipeline in place.
+          mkdir -p /var/jenkins_home
+          chown -R 1000:1000 /var/jenkins_home
+          docker run -d --name jenkins --restart unless-stopped \
+            -p 8080:8080 \
+            -v /var/jenkins_home:/var/jenkins_home \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v /home/ec2-user/src:/workspace \
+            --group-add "$(getent group docker | cut -d: -f3)" \
+            -e JAVA_OPTS=-Djenkins.install.runSetupWizard=false \
+            jenkins/jenkins:lts-jdk17
+
+          # The unlock password, for the operator. Written to a file rather than
+          # echoed, so it does not land in the user-data log.
+          for _ in $(seq 1 30); do
+            if docker exec jenkins test -f /var/jenkins_home/secrets/initialAdminPassword 2>/dev/null; then
+              docker exec jenkins cat /var/jenkins_home/secrets/initialAdminPassword \
+                > /root/jenkins-initial-password
+              chmod 600 /root/jenkins-initial-password
+              break
+            fi
+            sleep 5
+          done
+
+          echo "BUILD HOST READY" > /var/log/graviton-demo-ready
+
+  # ---------------------------------------------------------------------------
+  # Application hosts — identical configuration, different processor
+  # ---------------------------------------------------------------------------
+  X86AppHost:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref X86InstanceType
+      ImageId: !Ref X86AmiId
+      IamInstanceProfile: !Ref AppHostProfile
+      SubnetId: !Ref SubnetId
+      SecurityGroupIds: [!Ref AppSecurityGroup]
+      MetadataOptions:
+        # IMDSv2 only. Services/Platform.cs already speaks v2 (PUT for a token,
+        # then GET with the token header); this refuses v1 at the instance so the
+        # posture does not depend on an account-level default.
+        HttpEndpoint: enabled
+        HttpTokens: required
+        # The application runs in a container, which reaches 169.254.169.254 over
+        # the docker bridge -- two hops, not one. At the default limit of 1 the
+        # token request is dropped and the readout loses the instance type, which
+        # is the label identifying which processor produced a result.
+        HttpPutResponseHopLimit: 2
+      BlockDeviceMappings:
+        # Same 20 GiB as the build host. Each redeploy pulls another image tag
+        # and the previous one is not removed, so the AL2023 default of 8 GiB
+        # would run out after a handful of demo iterations.
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: 20
+            VolumeType: gp3
+            DeleteOnTermination: true
+            Encrypted: true
+      Tags:
+        - { Key: Name, Value: gadgetsonline-demo-x86 }
+        - { Key: Role, Value: app }
+        - { Key: Architecture, Value: x86_64 }
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euxo pipefail
+          exec > >(tee /var/log/user-data.log) 2>&1
+
+          dnf install -y docker
+          systemctl enable --now docker
+          usermod -aG docker ec2-user
+
+          # Stack facts, written by CloudFormation so the script below holds none.
+          cat > /etc/graviton-demo.env <<ENVFILE
+          ECR_REPO=${EcrRepository.RepositoryUri}
+          ECR_REGISTRY=${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com
+          DEMO_REGION=${AWS::Region}
+          ENVFILE
+
+          # Redeploy entry point. Invoked by SSM Run Command with the image tag
+          # as $1, so a redeploy never needs SSH or an instance replacement.
+          cat > /usr/local/bin/deploy-app.sh <<'DEPLOY'
+          #!/bin/bash
+          set -euo pipefail
+          # ${!1:-} not $1: this script runs under `set -u`, where a bare $1
+          # aborts on "unbound variable" BEFORE the guard below can report a
+          # usable message.
+          if [ -z "${!1:-}" ]; then echo "usage: deploy-app.sh <image-tag>" >&2; exit 2; fi
+          TAG="${!1:-}"
+          set -a; . /etc/graviton-demo.env; set +a
+          aws ecr get-login-password --region "$DEMO_REGION" \
+            | docker login --username AWS --password-stdin "$ECR_REGISTRY"
+          docker pull "$ECR_REPO:$TAG"
+          docker rm -f placeholder 2>/dev/null || true
+          docker rm -f gadgetsonline 2>/dev/null || true
+          docker run -d --name gadgetsonline --restart unless-stopped \
+            -p 80:80 -e ASPNETCORE_URLS=http://+:80 "$ECR_REPO:$TAG"
+          DEPLOY
+          chmod +x /usr/local/bin/deploy-app.sh
+
+          # Placeholder so the network path (subnet, security group, public DNS)
+          # can be verified before the application image exists.
+          docker run -d --name placeholder --restart unless-stopped -p 80:80 public.ecr.aws/nginx/nginx:latest
+
+          echo "APP HOST READY" > /var/log/graviton-demo-ready
+
+  ArmAppHost:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref ArmInstanceType
+      ImageId: !Ref ArmAmiId
+      IamInstanceProfile: !Ref AppHostProfile
+      SubnetId: !Ref SubnetId
+      SecurityGroupIds: [!Ref AppSecurityGroup]
+      MetadataOptions:
+        # IMDSv2 only. Services/Platform.cs already speaks v2 (PUT for a token,
+        # then GET with the token header); this refuses v1 at the instance so the
+        # posture does not depend on an account-level default.
+        HttpEndpoint: enabled
+        HttpTokens: required
+        # The application runs in a container, which reaches 169.254.169.254 over
+        # the docker bridge -- two hops, not one. At the default limit of 1 the
+        # token request is dropped and the readout loses the instance type, which
+        # is the label identifying which processor produced a result.
+        HttpPutResponseHopLimit: 2
+      BlockDeviceMappings:
+        # Same 20 GiB as the build host. Each redeploy pulls another image tag
+        # and the previous one is not removed, so the AL2023 default of 8 GiB
+        # would run out after a handful of demo iterations.
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: 20
+            VolumeType: gp3
+            DeleteOnTermination: true
+            Encrypted: true
+      Tags:
+        - { Key: Name, Value: gadgetsonline-demo-arm64 }
+        - { Key: Role, Value: app }
+        - { Key: Architecture, Value: arm64 }
+      UserData:
+        # Byte-for-byte identical to X86AppHost above. That the two hosts share
+        # one bootstrap and one image tag is the point being demonstrated.
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euxo pipefail
+          exec > >(tee /var/log/user-data.log) 2>&1
+
+          dnf install -y docker
+          systemctl enable --now docker
+          usermod -aG docker ec2-user
+
+          # Stack facts, written by CloudFormation so the script below holds none.
+          cat > /etc/graviton-demo.env <<ENVFILE
+          ECR_REPO=${EcrRepository.RepositoryUri}
+          ECR_REGISTRY=${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com
+          DEMO_REGION=${AWS::Region}
+          ENVFILE
+
+          # Redeploy entry point. Invoked by SSM Run Command with the image tag
+          # as $1, so a redeploy never needs SSH or an instance replacement.
+          cat > /usr/local/bin/deploy-app.sh <<'DEPLOY'
+          #!/bin/bash
+          set -euo pipefail
+          # ${!1:-} not $1: this script runs under `set -u`, where a bare $1
+          # aborts on "unbound variable" BEFORE the guard below can report a
+          # usable message.
+          if [ -z "${!1:-}" ]; then echo "usage: deploy-app.sh <image-tag>" >&2; exit 2; fi
+          TAG="${!1:-}"
+          set -a; . /etc/graviton-demo.env; set +a
+          aws ecr get-login-password --region "$DEMO_REGION" \
+            | docker login --username AWS --password-stdin "$ECR_REGISTRY"
+          docker pull "$ECR_REPO:$TAG"
+          docker rm -f placeholder 2>/dev/null || true
+          docker rm -f gadgetsonline 2>/dev/null || true
+          docker run -d --name gadgetsonline --restart unless-stopped \
+            -p 80:80 -e ASPNETCORE_URLS=http://+:80 "$ECR_REPO:$TAG"
+          DEPLOY
+          chmod +x /usr/local/bin/deploy-app.sh
+
+          docker run -d --name placeholder --restart unless-stopped -p 80:80 public.ecr.aws/nginx/nginx:latest
+
+          echo "APP HOST READY" > /var/log/graviton-demo-ready
+
+Outputs:
+  EcrRepositoryUri:
+    Description: Push and pull target for the demo image.
+    Value: !GetAtt EcrRepository.RepositoryUri
+
+  BuildHostId:
+    Description: Connect with `aws ssm start-session --target <this>`.
+    Value: !Ref BuildHost
+
+  X86InstanceId:
+    Value: !Ref X86AppHost
+
+  ArmInstanceId:
+    Value: !Ref ArmAppHost
+
+  X86Url:
+    Description: Intel host through the load balancer (needs AdminCidr set).
+    Value: !Sub "http://${LoadBalancer.DNSName}:8081/"
+
+  ArmUrl:
+    Description: Graviton host through the load balancer (needs AdminCidr set).
+    Value: !Sub "http://${LoadBalancer.DNSName}:8082/"
+
+  JenkinsUrl:
+    Description: Jenkins on the build host through the load balancer.
+    Value: !Sub "http://${LoadBalancer.DNSName}:8080/"
+
+  X86PortForwardCommand:
+    Description: >
+      Opens the Intel host on http://localhost:8081/ with no public exposure.
+    Value: !Sub >-
+      aws ssm start-session --region ${AWS::Region} --target ${X86AppHost}
+      --document-name AWS-StartPortForwardingSession
+      --parameters '{"portNumber":["80"],"localPortNumber":["8081"]}'
+
+  ArmPortForwardCommand:
+    Description: >
+      Opens the Graviton host on http://localhost:8082/ with no public exposure.
+    Value: !Sub >-
+      aws ssm start-session --region ${AWS::Region} --target ${ArmAppHost}
+      --document-name AWS-StartPortForwardingSession
+      --parameters '{"portNumber":["80"],"localPortNumber":["8082"]}'
+
+  DemoInstanceTypes:
+    Description: The comparison being demonstrated.
+    Value: !Sub "${X86InstanceType} (Intel) vs ${ArmInstanceType} (Graviton)"

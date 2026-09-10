@@ -1,0 +1,280 @@
+// Build the GadgetsOnline image for both processor architectures and deploy each
+// to its own EC2 instance.
+//
+// One buildx invocation produces both architectures -- that is the point being
+// demonstrated, so this pipeline does NOT build twice. The two architectures
+// become visible as parallel branches in the stage view, at the points where
+// they genuinely diverge: verification of each child manifest, and deployment to
+// each processor.
+//
+// Replaces Jenkins_Config/Jenkinsfile, which needed an x86 agent and an arm64
+// agent wired into one buildx builder over SSH. That whole mechanism is gone.
+
+pipeline {
+    agent any
+
+    options {
+        timestamps()
+        ansiColor('xterm')
+        disableConcurrentBuilds()
+        buildDiscarder(logRotator(numToKeepStr: '20'))
+    }
+
+    environment {
+        SRC         = '/workspace'
+        DOCKERFILE  = 'Dotnet_App/GadgetsOnline/Dockerfile'
+        PLATFORMS   = 'linux/amd64,linux/arm64'
+        IMAGE_TAG   = "b${env.BUILD_NUMBER}"
+        // This container has its own buildx config, so it needs its own named
+        // builder rather than the one created on the host for ec2-user.
+        BUILDER     = 'jenkins-multiarch'
+    }
+
+    stages {
+
+        stage('Load stack facts') {
+            steps {
+                script {
+                    // Written by CloudFormation on the build host. Nothing about
+                    // this account is hardcoded in the repository.
+                    def facts = sh(script: 'cat /etc/graviton-demo.env', returnStdout: true).trim()
+                    facts.split('\n').each { line ->
+                        def (k, v) = line.split('=', 2)
+                        env[k] = v
+                    }
+                }
+                sh '''
+                    echo "registry     : $ECR_REGISTRY"
+                    echo "repository   : $ECR_REPO"
+                    echo "region       : $DEMO_REGION"
+                    echo "Intel host   : $X86_INSTANCE_ID"
+                    echo "Graviton host: $ARM_INSTANCE_ID"
+                    echo "image tag    : $IMAGE_TAG"
+                '''
+            }
+        }
+
+        stage('Authenticate to ECR') {
+            steps {
+                sh '''
+                    aws ecr get-login-password --region "$DEMO_REGION" \
+                      | docker login --username AWS --password-stdin "$ECR_REGISTRY"
+                '''
+            }
+        }
+
+        stage('Prepare the builder') {
+            steps {
+                // buildx's default `docker` driver cannot emit more than one
+                // platform -- it fails with "Multi-platform build is not supported
+                // for the docker driver". A docker-container driver can.
+                //
+                // This container shares the host's docker socket but keeps its own
+                // buildx configuration, so a builder created on the host for
+                // another user is not visible here and has to be created once from
+                // inside Jenkins. The BuildKit container it starts runs on the
+                // host, where the amd64 binfmt handler is already registered
+                // kernel-wide.
+                sh '''
+                    if ! docker buildx inspect "$BUILDER" >/dev/null 2>&1; then
+                      echo "creating buildx builder: $BUILDER"
+                      docker buildx create --name "$BUILDER" --driver docker-container
+                    fi
+                    docker buildx inspect --bootstrap --builder "$BUILDER"
+
+                    PLATFORMS_AVAILABLE=$(docker buildx inspect "$BUILDER" \
+                      | sed -n 's/^Platforms:[[:space:]]*//p')
+                    echo "builder platforms: $PLATFORMS_AVAILABLE"
+
+                    for WANT in linux/amd64 linux/arm64; do
+                      case "$PLATFORMS_AVAILABLE" in
+                        *"$WANT"*) echo "  $WANT available" ;;
+                        *) echo "  $WANT MISSING -- register its binfmt handler on the host"; exit 1 ;;
+                      esac
+                    done
+                '''
+            }
+        }
+
+        stage('Build both architectures') {
+            steps {
+                // --platform=$BUILDPLATFORM in the Dockerfile pins the compile
+                // stage to the build host's own architecture. .NET publishes
+                // architecture-neutral IL, so the compile happens once at native
+                // speed and only the runtime layer differs per target. No
+                // emulation, no second agent.
+                //
+                // Attestations off: BuildKit otherwise attaches provenance and
+                // SBOM manifests that show up in ECR as untagged 1.3 KB records
+                // with no platform.
+                sh '''
+                    cd "$SRC"
+                    docker buildx build \
+                      --builder "$BUILDER" \
+                      --platform "$PLATFORMS" \
+                      --provenance=false \
+                      --sbom=false \
+                      --tag "$ECR_REPO:$IMAGE_TAG" \
+                      --file "$DOCKERFILE" \
+                      --push \
+                      .
+                '''
+            }
+        }
+
+        stage('Verify each architecture') {
+            // Where the two architectures genuinely diverge for the first time.
+            parallel {
+                stage('amd64 — Intel') {
+                    steps {
+                        script { verifyArch('amd64') }
+                    }
+                }
+                stage('arm64 — Graviton') {
+                    steps {
+                        script { verifyArch('arm64') }
+                    }
+                }
+            }
+        }
+
+        stage('Deploy to each processor') {
+            parallel {
+                stage('c6i.xlarge — Intel') {
+                    steps {
+                        script { deployTo(env.X86_INSTANCE_ID, 'c6i.xlarge (Intel)') }
+                    }
+                }
+                stage('c7g.xlarge — Graviton') {
+                    steps {
+                        script { deployTo(env.ARM_INSTANCE_ID, 'c7g.xlarge (Graviton3)') }
+                    }
+                }
+            }
+        }
+
+        stage('Smoke test both') {
+            steps {
+                sh '''
+                    FAILED=0
+                    for PAIR in "$X86_INSTANCE_ID:Intel" "$ARM_INSTANCE_ID:Graviton"; do
+                      ID="${PAIR%%:*}"; NAME="${PAIR#*:}"
+                      IP=$(aws ec2 describe-instances --region "$DEMO_REGION" \
+                             --instance-ids "$ID" \
+                             --query 'Reservations[0].Instances[0].PrivateIpAddress' \
+                             --output text)
+
+                      CODE=000
+                      for _ in $(seq 1 20); do
+                        CODE=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "http://$IP/" || echo 000)
+                        [ "$CODE" = "200" ] && break
+                        sleep 3
+                      done
+
+                      if [ "$CODE" = "200" ]; then
+                        ARCH=$(curl -s --max-time 5 "http://$IP/Recommendations/Status" \
+                                 | jq -r '.architecture + " / " + .instanceType')
+                        echo "PASS  $NAME  HTTP 200  reports: $ARCH"
+                      else
+                        echo "FAIL  $NAME  HTTP $CODE"
+                        FAILED=1
+                      fi
+                    done
+                    exit $FAILED
+                '''
+            }
+        }
+    }
+
+    post {
+        success {
+            sh '''
+                echo ""
+                echo "=========================================================="
+                echo " Tag $IMAGE_TAG is live on BOTH architectures"
+                echo "   one image index, two child manifests"
+                echo "   one build invocation, no emulation, no second agent"
+                echo "=========================================================="
+            '''
+        }
+        failure {
+            echo 'Build or deploy failed. The previous tag is still running on both hosts.'
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers. Kept out of the stages so the two parallel branches are visibly
+// identical except for the architecture they name.
+// ---------------------------------------------------------------------------
+
+/** Asserts the pushed index contains this architecture, then names it in ECR. */
+void verifyArch(String arch) {
+    withEnv(["ARCH=${arch}"]) {
+        sh '''
+            REPO_NAME="${ECR_REPO##*/}"
+
+            DIGEST=$(docker buildx imagetools inspect --builder "$BUILDER" "$ECR_REPO:$IMAGE_TAG" --raw \
+              | jq -r --arg a "$ARCH" '.manifests[] | select(.platform.architecture == $a) | .digest')
+
+            if [ -z "$DIGEST" ] || [ "$DIGEST" = "null" ]; then
+              echo "FAIL: no $ARCH manifest in the image index"
+              exit 1
+            fi
+            echo "PASS: $ARCH present  digest=$DIGEST"
+
+            # Tag the child manifest so the registry names the architecture
+            # instead of listing an anonymous digest. put-image applies a tag to
+            # an existing manifest; `imagetools create` would instead wrap the
+            # child in a new single-platform index and add a second record.
+            MANIFEST=$(aws ecr batch-get-image --region "$DEMO_REGION" \
+                         --repository-name "$REPO_NAME" \
+                         --image-ids "imageDigest=$DIGEST" \
+                         --query 'images[0].imageManifest' --output text)
+
+            aws ecr put-image --region "$DEMO_REGION" \
+              --repository-name "$REPO_NAME" \
+              --image-tag "$IMAGE_TAG-$ARCH" \
+              --image-manifest "$MANIFEST" \
+              --query 'image.imageId.imageTag' --output text 2>/dev/null \
+              || echo "tag $IMAGE_TAG-$ARCH already applied"
+
+            echo "tagged: $IMAGE_TAG-$ARCH"
+        '''
+    }
+}
+
+/** Deploys the tag to one instance over Systems Manager -- no SSH, no keys. */
+void deployTo(String instanceId, String label) {
+    withEnv(["TARGET_ID=${instanceId}", "TARGET_LABEL=${label}"]) {
+        sh '''
+            echo "deploying $IMAGE_TAG to $TARGET_LABEL ($TARGET_ID)"
+
+            CMD_ID=$(aws ssm send-command --region "$DEMO_REGION" \
+                       --instance-ids "$TARGET_ID" \
+                       --document-name AWS-RunShellScript \
+                       --comment "Jenkins deploy $IMAGE_TAG" \
+                       --parameters "commands=['/usr/local/bin/deploy-app.sh $IMAGE_TAG']" \
+                       --query Command.CommandId --output text)
+
+            for _ in $(seq 1 60); do
+              STATUS=$(aws ssm get-command-invocation --region "$DEMO_REGION" \
+                         --command-id "$CMD_ID" --instance-id "$TARGET_ID" \
+                         --query Status --output text 2>/dev/null || echo Pending)
+              case "$STATUS" in
+                Success) echo "$TARGET_LABEL: $STATUS"; exit 0 ;;
+                Failed|Cancelled|TimedOut)
+                  echo "$TARGET_LABEL: $STATUS"
+                  aws ssm get-command-invocation --region "$DEMO_REGION" \
+                    --command-id "$CMD_ID" --instance-id "$TARGET_ID" \
+                    --query StandardErrorContent --output text
+                  exit 1 ;;
+                *) sleep 3 ;;
+              esac
+            done
+
+            echo "$TARGET_LABEL: timed out waiting for the deploy command"
+            exit 1
+        '''
+    }
+}

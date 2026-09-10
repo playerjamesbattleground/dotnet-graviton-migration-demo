@@ -1,0 +1,60 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: gadgets-online-svc
+  labels:
+    app: gadgets-online
+spec:
+  type: LoadBalancer
+  ports:
+  - port: 80
+  selector:
+    app: gadgets-online
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gadgets-online-deploy
+  labels:
+    app: gadgets-online
+spec:
+  replicas: 4
+  selector:
+    matchLabels:
+      app: gadgets-online
+  template:
+    metadata:
+      labels:
+        app: gadgets-online
+    spec:
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                - key: app
+                  operator: In
+                  values:
+                  - gadgets-online
+              topologyKey: kubernetes.io/arch
+      containers:
+      - name: gadgets-online
+        image: nginx:latest
+        ports:
+        - containerPort: 80
+        env:
+        - name: dbmode
+          value: inMem
+        - name: COMPlus_PerfMapEnabled
+          value: '1'
+        - name: COMPlus_EnableEventLog
+          value: '1'
+        resources:
+          requests:
+            memory: "2048Mi"
+            cpu: "1"
+          limits:
+            memory: "2048Mi"
+            cpu: "1"

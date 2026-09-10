@@ -1,0 +1,108 @@
+// ENV Variable needed by this Jenkinsfile
+// $ECR_Repo $EKS_Cluster $DockerImage
+// Jenkins default ENV Variable used:
+// $BUILD_ID
+
+pipeline {
+    agent any
+    
+    stages {
+        stage('Check_or_Install_prerequisites_on_x86_agent') {
+            agent {
+                label 'aws_ec2_linux_al2_x86_64'
+            }
+            steps {
+                echo 'Check for docker and buildx plugin and install if not already installed.'
+                sh '''
+                # env
+                if ! which docker >/dev/null 2>&1; then sudo yum install docker -y; fi
+                if ! [[ $(systemctl show --property SubState docker) =~ \'running\' ]]; then sudo systemctl enable docker --now; fi
+                if ! id | grep -i docker >/dev/null 2>&1; then sudo usermod -aG docker $USER; fi
+                if ! docker buildx ls >/dev/null 2>&1; then
+                  sudo docker run -d -it docker/buildx-bin bash >/dev/null 2>&1 || true
+                  CONTAINER=$(sudo docker ps -a --filter=ancestor=docker/buildx-bin | awk \'{print $1}\' | tail -1)
+                  mkdir -p /usr/libexec/docker/cli-plugins/
+                  sudo docker cp $CONTAINER:/buildx /usr/libexec/docker/cli-plugins/docker-buildx
+                  # sudo docker run --rm --privileged multiarch/qemu-user-static --reset -p yes
+                  sudo docker buildx ls
+                fi'''
+            }
+        }
+        stage('Build') {
+            agent {
+                label 'aws_ec2_linux_al2_x86_64'
+            }
+            steps {
+                echo 'Building Docker Image'
+                sh '''
+                TOKEN=$(curl -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
+                REGION=$(curl -H "X-aws-ec2-metadata-token: $TOKEN" -s 169.254.169.254/latest/meta-data/placement/region)
+                BUILDER_NAME='jenkins'
+                DOCKER='docker --config ./docker-buildx-config'
+                #$DOCKER -H ssh://ec2-user@$X86_AGENT_PRIVATE_IP info
+                if ! $DOCKER buildx inspect $BUILDER_NAME > /dev/null 2>&1; then
+                    $DOCKER buildx create --name $BUILDER_NAME
+                    #$DOCKER buildx create --name $BUILDER_NAME --driver docker-container --platform linux/amd64 ssh://ec2-user@$X86_AGENT_PRIVATE_IP --append
+                    $DOCKER buildx inspect --bootstrap --builder $BUILDER_NAME
+                    $DOCKER buildx use $BUILDER_NAME
+                fi
+                $DOCKER buildx ls
+                aws ecr get-login-password --region $REGION | $DOCKER login --username AWS --password-stdin $ECR_Repo
+                $DOCKER buildx build -t $ECR_Repo:$BUILD_ID --platform linux/amd64 --builder jenkins \
+                --build-arg BUILDKIT_MULTI_PLATFORM=1 -f ./Dotnet_App/GadgetsOnline/Dockerfile --push .
+                '''
+            }
+        }
+        stage('Test') {
+            agent {
+                label 'aws_ec2_linux_al2_x86_64'
+            }
+            steps {
+                echo 'Test 1: Checking if container is being created from the image.'
+                sh '''
+                TOKEN=$(curl -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
+                export AWS_REGION=$(curl -H "X-aws-ec2-metadata-token: $TOKEN" -s 169.254.169.254/latest/meta-data/placement/region)
+                DOCKER='docker --config ./docker-buildx-config'
+                aws ecr get-login-password --region $AWS_REGION | $DOCKER login --username AWS --password-stdin $ECR_Repo
+                DOCKER_ID=$($DOCKER run -d -p 8888:80 $ECR_Repo:$BUILD_ID)
+                sleep 5
+                HTTP_RESP=$(curl -s -o /dev/null -I -w "%{http_code}" localhost:8888)
+                # $DOCKER stop $($DOCKER ps -q --filter="ancestor=$ECR_Repo:$BUILD_ID")
+                $DOCKER stop $DOCKER_ID
+                if [[ $HTTP_RESP == "200" ]]; then
+                  echo "Container launched successfully. Test PASSED!!"
+                else
+                  echo "Container could not launch successfully. Test Failed."
+                  exit 1
+                fi
+                '''
+            }
+        }
+        stage('Deploy to EKS') {
+            steps {
+                withAWS(credentials: 'IAM-Admin-Credential') {
+                  sh '''
+                  TOKEN=$(curl -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
+                  export AWS_REGION=$(curl -H "X-aws-ec2-metadata-token: $TOKEN" -s 169.254.169.254/latest/meta-data/placement/region)
+                  aws eks update-kubeconfig --name $EKS_Cluster
+                  kubectl get pod --all-namespaces
+                  sed -ie "/image:/s_nginx:latest_${DockerImage}_" ./K8s_Yaml/EKSDeployment.yaml
+                  yq 'select(documentIndex == 0)' ./K8s_Yaml/EKSDeployment.yaml | kubectl apply -f -
+                  yq "select(documentIndex == 1)|.spec.template.spec.containers[0].env += \
+                  {\\\"name\\\": \\\"IMAGE_TAG\\\", \\\"value\\\": \\\"$BUILD_ID\\\"} | \
+                  .spec.template.spec.affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms[0].matchExpressions[0].values[0]=\\\"amd64\\\"" \
+                  ./K8s_Yaml/EKSDeployment.yaml | kubectl apply -f - 
+                  # kubectl apply -f ./K8s_Yaml/EKSDeployment.yaml
+                  kubectl get svc,pod -o wide
+                  '''
+                }
+            }
+        }
+    }
+    post {
+        always {
+            echo 'Deleting Workspace'
+            cleanWs deleteDirs: true
+        }
+    }
+}

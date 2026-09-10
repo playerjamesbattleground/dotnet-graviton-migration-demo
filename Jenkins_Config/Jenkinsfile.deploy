@@ -1,0 +1,151 @@
+// Deploy the multi-architecture image to ONE host.
+//
+// Seeded twice. setup-jenkins.sh substitutes three placeholders, so the stage
+// names on screen name the actual chip rather than a generic "target":
+//
+//   02-deploy-x86     TARGET_ARCH=amd64  ARCH_SHOWN=x86_64  CHIP=Intel
+//   03-deploy-arm64   TARGET_ARCH=arm64  ARCH_SHOWN=Arm64   CHIP=Graviton
+//
+// Two stages, because two things happen: the host pulls and runs the tag, then it
+// reports which entry it got. Nothing here builds, and nothing here names an
+// architecture in the command it runs -- the platform decides.
+//
+// TARGET_ARCH keeps the OCI name because it is compared against
+// `docker image inspect --format {{.Architecture}}`, which reports amd64/arm64
+// and nothing else. ARCH_SHOWN is what a reader sees: "amd64" beside an Intel
+// host reads as a mistake unless you know AMD designed the 64-bit x86 extension
+// and Intel adopted it.
+
+pipeline {
+    agent any
+
+    options {
+        timestamps()
+        ansiColor('xterm')
+        disableConcurrentBuilds()
+        buildDiscarder(logRotator(numToKeepStr: '20'))
+    }
+
+    parameters {
+        string(
+            name: 'IMAGE_TAG',
+            defaultValue: 'latest',
+            description: 'Tag to deploy. Leave as latest to take whatever 01-build-multiarch released most recently.'
+        )
+    }
+
+    environment {
+        TARGET_ARCH = '@@TARGET_ARCH@@'
+        ARCH_SHOWN  = '@@ARCH_SHOWN@@'
+        CHIP        = '@@CHIP@@'
+    }
+
+    stages {
+
+        stage('Pull :latest onto @@CHIP@@') {
+            steps {
+                script {
+                    // Written by CloudFormation on the build host, so nothing about
+                    // this account is hardcoded in the repository.
+                    def facts = sh(script: 'cat /etc/graviton-demo.env', returnStdout: true).trim()
+                    facts.split('\n').each { line ->
+                        def (k, v) = line.split('=', 2)
+                        env[k] = v
+                    }
+
+                    env.TARGET_ID = (env.TARGET_ARCH == 'amd64')
+                        ? env.X86_INSTANCE_ID : env.ARM_INSTANCE_ID
+                    env.TARGET_LABEL = (env.TARGET_ARCH == 'amd64') ? 'c6i.xlarge' : 'c7g.xlarge'
+
+                    // Jenkins does not apply a parameter's defaultValue on the FIRST
+                    // build of a job -- the definitions are only registered once a run
+                    // has completed -- so params.IMAGE_TAG is null until then.
+                    env.IMAGE_TAG = (params.IMAGE_TAG ?: '').trim() ?: 'latest'
+                }
+                sh '''
+                    set +x
+                    printf "  host       %s (%s)\\n" "$TARGET_LABEL" "$CHIP"
+                    printf "  command    docker run -p 80:80 %s:%s\\n" "${ECR_REPO##*/}" "$IMAGE_TAG"
+                    echo   "             identical in both deploy pipelines"
+                    echo ""
+
+                    CMD_ID=$(aws ssm send-command --region "$DEMO_REGION" \
+                               --instance-ids "$TARGET_ID" \
+                               --document-name AWS-RunShellScript \
+                               --comment "Deploy $IMAGE_TAG to $TARGET_LABEL" \
+                               --parameters "commands=['/usr/local/bin/deploy-app.sh $IMAGE_TAG']" \
+                               --query Command.CommandId --output text)
+
+                    STATUS=Pending
+                    for _ in $(seq 1 60); do
+                      STATUS=$(aws ssm get-command-invocation --region "$DEMO_REGION" \
+                                 --command-id "$CMD_ID" --instance-id "$TARGET_ID" \
+                                 --query Status --output text 2>/dev/null || echo Pending)
+                      case "$STATUS" in
+                        Success) break ;;
+                        Failed|Cancelled|TimedOut)
+                          printf "  %s\\n\\n" "$STATUS"
+                          aws ssm get-command-invocation --region "$DEMO_REGION" \
+                            --command-id "$CMD_ID" --instance-id "$TARGET_ID" \
+                            --query StandardErrorContent --output text
+                          exit 1 ;;
+                        *) sleep 3 ;;
+                      esac
+                    done
+
+                    [ "$STATUS" = "Success" ] || { echo "  timed out"; exit 1; }
+                    printf "  %s\\n" "$STATUS"
+                '''
+            }
+        }
+
+        stage('Confirm it received @@ARCH_SHOWN@@') {
+            steps {
+                // Reads what the host recorded when it pulled. Not a smoke test and
+                // not a benchmark -- it is the evidence that one tag served two
+                // different processors.
+                sh '''
+                    set +x
+                    CMD_ID=$(aws ssm send-command --region "$DEMO_REGION" \
+                               --instance-ids "$TARGET_ID" \
+                               --document-name AWS-RunShellScript \
+                               --comment "Report the running image" \
+                               --parameters 'commands=["docker image inspect --format \\"{{.Architecture}} {{.Id}}\\" $(docker inspect --format \\"{{.Image}}\\" gadgetsonline)"]' \
+                               --query Command.CommandId --output text)
+
+                    for _ in $(seq 1 30); do
+                      STATUS=$(aws ssm get-command-invocation --region "$DEMO_REGION" \
+                                 --command-id "$CMD_ID" --instance-id "$TARGET_ID" \
+                                 --query Status --output text 2>/dev/null || echo Pending)
+                      case "$STATUS" in
+                        Success|Failed|Cancelled|TimedOut) break ;;
+                        *) sleep 2 ;;
+                      esac
+                    done
+
+                    OUT=$(aws ssm get-command-invocation --region "$DEMO_REGION" \
+                            --command-id "$CMD_ID" --instance-id "$TARGET_ID" \
+                            --query StandardOutputContent --output text 2>/dev/null | tr -d '\\r')
+
+                    ARCH=$(echo "$OUT" | awk 'NF{print $1; exit}')
+                    IMG=$(echo "$OUT" | awk 'NF{print $2; exit}')
+
+                    printf "  asked for   %s:%s\\n" "${ECR_REPO##*/}" "$IMAGE_TAG"
+                    printf "  received    %s   [docker: %s]\\n" "$ARCH_SHOWN" "${ARCH:-unknown}"
+                    printf "  image id    %s\\n" "${IMG:-unknown}"
+
+                    if [ "$ARCH" != "$TARGET_ARCH" ]; then
+                      printf "\\n  FAIL  expected %s, host reports %s\\n" "$TARGET_ARCH" "${ARCH:-nothing}"
+                      exit 1
+                    fi
+                '''
+            }
+        }
+    }
+
+    post {
+        failure {
+            echo "Deploy failed. ${env.TARGET_LABEL} still runs whatever it had."
+        }
+    }
+}

@@ -1,0 +1,149 @@
+// CI: build ONE image that runs on both processors.
+//
+// Three stages, because three things actually have to happen: build it, check it
+// carries both architectures, release it. Registry sign-in and builder creation
+// are plumbing and sit inside the build stage rather than taking a column of
+// their own -- during a live demo the stage names are the only thing on screen,
+// so each one has to be a step worth pointing at.
+//
+// Console output is values, not prose. Nobody reads a log during a demo.
+//
+// Replaces Jenkins_Config/Jenkinsfile, which needed an x86 agent and an arm64
+// agent wired into one buildx builder over SSH. That mechanism is gone.
+
+pipeline {
+    agent any
+
+    options {
+        timestamps()
+        ansiColor('xterm')
+        disableConcurrentBuilds()
+        buildDiscarder(logRotator(numToKeepStr: '20'))
+    }
+
+    environment {
+        SRC        = '/workspace'
+        DOCKERFILE = 'Dotnet_App/GadgetsOnline/Dockerfile'
+        PLATFORMS  = 'linux/amd64,linux/arm64'
+        IMAGE_TAG  = "b${env.BUILD_NUMBER}"
+        BUILDER    = 'jenkins-multiarch'
+    }
+
+    stages {
+
+        stage('Build image for x86_64 + Arm64') {
+            steps {
+                script {
+                    // Written by CloudFormation on the build host, so nothing about
+                    // this account is hardcoded in the repository.
+                    def facts = sh(script: 'cat /etc/graviton-demo.env', returnStdout: true).trim()
+                    facts.split('\n').each { line ->
+                        def (k, v) = line.split('=', 2)
+                        env[k] = v
+                    }
+                }
+                sh '''
+                    set +x
+                    printf "  tag        %s\\n" "$IMAGE_TAG"
+                    printf "  platforms  %s\\n" "$PLATFORMS"
+                    echo   "             linux/amd64 = x86_64 (c6i, Intel)"
+                    echo   "             linux/arm64 = Arm64  (c7g, Graviton)"
+                    echo ""
+
+                    # Plumbing, folded in: sign in, and ensure a builder exists that
+                    # accepts more than one platform. buildx's default driver refuses
+                    # a second one.
+                    aws ecr get-login-password --region "$DEMO_REGION" \
+                      | docker login --username AWS --password-stdin "$ECR_REGISTRY" >/dev/null
+
+                    if ! docker buildx inspect "$BUILDER" >/dev/null 2>&1; then
+                      docker buildx create --name "$BUILDER" --driver docker-container \
+                        --platform linux/amd64,linux/arm64 >/dev/null
+                    fi
+                    docker buildx inspect --bootstrap --builder "$BUILDER" >/dev/null
+
+                    set -x
+                    cd "$SRC"
+                    docker buildx build \
+                      --builder "$BUILDER" \
+                      --platform "$PLATFORMS" \
+                      --provenance=false \
+                      --sbom=false \
+                      --tag "$ECR_REPO:$IMAGE_TAG" \
+                      --file "$DOCKERFILE" \
+                      --push \
+                      .
+                '''
+            }
+        }
+
+        stage('Verify one image, both arches') {
+            steps {
+                sh '''
+                    set +x
+                    RAW=$(docker buildx imagetools inspect --builder "$BUILDER" \
+                            "$ECR_REPO:$IMAGE_TAG" --raw)
+
+                    COUNT=$(echo "$RAW" | jq '[.manifests[].platform.architecture]
+                              | map(select(. != "unknown")) | length')
+                    if [ "$COUNT" != "2" ]; then
+                      echo "  expected exactly 2 architectures, found $COUNT"
+                      exit 1
+                    fi
+                    echo ""
+
+                    # Measured from the registry rather than asserted: the application
+                    # layer carries the same digest under both architectures, so it is
+                    # stored once and only the runtime beneath it differs.
+                    python3 /workspace/CFN_Demo/jenkins/inspect-image.py \
+                      "${ECR_REPO##*/}" "$IMAGE_TAG" --region "$DEMO_REGION"
+                '''
+            }
+        }
+
+        stage('Release as :latest') {
+            steps {
+                sh '''
+                    set +x
+                    REPO_NAME="${ECR_REPO##*/}"
+
+                    # Name each entry, so the registry console shows both
+                    # architectures instead of two anonymous digests.
+                    for ARCH in amd64 arm64; do
+                      DIGEST=$(docker buildx imagetools inspect --builder "$BUILDER" \
+                                 "$ECR_REPO:$IMAGE_TAG" --raw \
+                                 | jq -r --arg a "$ARCH" \
+                                   '.manifests[] | select(.platform.architecture == $a) | .digest')
+
+                      MANIFEST=$(aws ecr batch-get-image --region "$DEMO_REGION" \
+                                   --repository-name "$REPO_NAME" \
+                                   --image-ids "imageDigest=$DIGEST" \
+                                   --query 'images[0].imageManifest' --output text)
+
+                      aws ecr put-image --region "$DEMO_REGION" \
+                        --repository-name "$REPO_NAME" \
+                        --image-tag "$IMAGE_TAG-$ARCH" \
+                        --image-manifest "$MANIFEST" \
+                        --query 'image.imageId.imageTag' --output text >/dev/null 2>&1 || true
+                    done
+
+                    # :latest is what both deploy pipelines ask for, so neither needs
+                    # to know a build number.
+                    docker buildx imagetools create --builder "$BUILDER" \
+                      --tag "$ECR_REPO:latest" "$ECR_REPO:$IMAGE_TAG" >/dev/null 2>&1
+
+                    printf "  %-12s x86_64 + Arm64\\n" "$IMAGE_TAG"
+                    printf "  %-12s x86_64 alone\\n" "$IMAGE_TAG-amd64"
+                    printf "  %-12s Arm64 alone\\n" "$IMAGE_TAG-arm64"
+                    printf "  %-12s -> %s\\n" "latest" "$IMAGE_TAG"
+                '''
+            }
+        }
+    }
+
+    post {
+        failure {
+            echo 'Build failed. The previously released :latest is untouched.'
+        }
+    }
+}

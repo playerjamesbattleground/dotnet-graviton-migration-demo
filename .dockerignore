@@ -1,0 +1,47 @@
+# Build context for Dotnet_App/GadgetsOnline/Dockerfile. The context is the
+# repository root, so everything below would otherwise be shipped to BuildKit and
+# copied into the image by `COPY ./Dotnet_App/ .`.
+
+# ---------------------------------------------------------------------------
+# macOS AppleDouble sidecars -- the reason this file exists
+# ---------------------------------------------------------------------------
+# macOS tar writes a `._<name>` companion for any file carrying extended
+# attributes. Extracted on Linux those become real files, and `._Startup.cs`
+# lands in the compiler's source list, which fails the build with
+# "error CS2015: '...' is a binary file instead of a text file" -- once per
+# source file, so 21 errors from a build that is otherwise fine.
+._*
+.DS_Store
+.AppleDouble
+.LSOverride
+__MACOSX
+
+# ---------------------------------------------------------------------------
+# Build output. Restored and rebuilt inside the image; a host copy carries
+# absolute paths from the machine that produced it.
+# ---------------------------------------------------------------------------
+**/bin/
+**/obj/
+**/.vs/
+**/publish/
+**/*.user
+
+# ---------------------------------------------------------------------------
+# Nothing here is needed to compile or run the application
+# ---------------------------------------------------------------------------
+.git
+.gitignore
+.claude/
+aidlc/
+doc/
+CFN_Yaml/
+CFN_Demo/
+K8s_Yaml/
+Jenkins_Config/
+**/*.md
+LICENSE.txt
+
+# Python tooling for the diagrams
+**/.venv/
+**/__pycache__/
+**/*.py[cod]

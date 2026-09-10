@@ -1,0 +1,94 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: 'EKS Managed Node group'
+
+Parameters:
+  PrivateSubnets:
+    Type: String
+    Description: Command separated Subnets Ids of the VPC to which EC2 instances and EKS Cluster will be launched
+  ClusterSecurityGroupId:
+    Type: 'List<AWS::EC2::SecurityGroup::Id>'
+    Description: Security group for EKS Cluster
+  EKSClusterName:
+    Type: String
+    Description: 'EKS Cluster Name'
+  EKSNodeInstanceType:
+    Type: String
+    Default: m6g.xlarge
+    Description: 'EKS Nodegroup EC2 Instance Type'
+  EKSNodeInstanceRole:
+    Type: String
+    Description: 'EKS Nodegroup IAM Role ARN'
+  EKSNodeAmiType:
+    Type: String
+    Description: 'EKS Nodegroup AMI Type'
+    Default: AL2_ARM_64
+
+Resources:
+  LaunchTemplate:
+    Type: 'AWS::EC2::LaunchTemplate'
+    Properties:
+      LaunchTemplateData:
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs:
+              Iops: 3000
+              Throughput: 125
+              VolumeSize: 80
+              VolumeType: gp3
+        MetadataOptions:
+          HttpPutResponseHopLimit: 2
+          HttpTokens: optional
+        SecurityGroupIds:
+          !Ref ClusterSecurityGroupId 
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: !Sub '${AWS::StackName}'
+              - Key: alpha.eksctl.io/nodegroup-name
+                Value: !Sub ${AWS::StackName}
+              - Key: alpha.eksctl.io/nodegroup-type
+                Value: managed
+          - ResourceType: volume
+            Tags:
+              - Key: Name
+                Value: !Sub '${AWS::StackName}'
+              - Key: alpha.eksctl.io/nodegroup-name
+                Value: !Sub ${AWS::StackName}
+              - Key: alpha.eksctl.io/nodegroup-type
+                Value: managed
+          - ResourceType: network-interface
+            Tags:
+              - Key: Name
+                Value: !Sub '${AWS::StackName}'
+              - Key: alpha.eksctl.io/nodegroup-name
+                Value: !Sub ${AWS::StackName}
+              - Key: alpha.eksctl.io/nodegroup-type
+                Value: managed
+      LaunchTemplateName: !Sub '${AWS::StackName}'
+  ManagedNodeGroup:
+    Type: 'AWS::EKS::Nodegroup'
+    Properties:
+      AmiType: !Ref EKSNodeAmiType
+      ClusterName: !Ref EKSClusterName
+      InstanceTypes:
+        - !Ref EKSNodeInstanceType
+      Labels:
+        alpha.eksctl.io/cluster-name: !Ref EKSClusterName
+        alpha.eksctl.io/nodegroup-name: !Sub ${AWS::StackName}
+      LaunchTemplate:
+        Id: !Ref LaunchTemplate
+      NodeRole: !Ref EKSNodeInstanceRole
+      # NodegroupName: !Sub ${AWS::StackName}
+      ScalingConfig:
+        DesiredSize: 2
+        MaxSize: 4
+        MinSize: 0
+      Subnets: !Split 
+        - ','
+        - !Ref PrivateSubnets
+      Tags:
+        alpha.eksctl.io/nodegroup-name: !Sub ${AWS::StackName}
+        alpha.eksctl.io/nodegroup-type: managed
+        
+

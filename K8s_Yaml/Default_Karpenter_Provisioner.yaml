@@ -1,0 +1,38 @@
+# Deploy this yaml manually by changing subnetSelector and any other parameter as required.
+apiVersion: karpenter.sh/v1alpha5
+kind: Provisioner
+metadata:
+  name: default
+spec:
+  requirements:
+    - key: "karpenter.k8s.aws/instance-category"
+      operator: In
+      values: ["c", "m", "r"]
+    - key: "karpenter.k8s.aws/instance-cpu"
+      operator: In
+      values: ["2", "4"]
+    - key: "karpenter.k8s.aws/instance-generation"
+      operator: Gt
+      values: ["4"]
+    - key: kubernetes.io/arch
+      operator: In
+      values: ["arm64", "amd64"]
+    - key: "karpenter.sh/capacity-type"
+      operator: In
+      values: ["spot", "on-demand"]
+  limits:
+    resources:
+      cpu: 80
+  providerRef:
+    name: default
+  ttlSecondsAfterEmpty: 300
+---
+apiVersion: karpenter.k8s.aws/v1alpha1
+kind: AWSNodeTemplate
+metadata:
+  name: default
+spec:
+  subnetSelector:
+    karpenter.sh/discovery: GadgetsOnlineInfra-EKSClusterStack-17A66C6A19BY5
+  securityGroupSelector:
+    karpenter.sh/discovery: GadgetsOnlineInfra-EKSClusterStack-17A66C6A19BY5

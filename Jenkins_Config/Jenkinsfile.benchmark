@@ -1,0 +1,280 @@
+// Run the CPU benchmark on both processors and print the comparison.
+//
+// Kept separate from the build pipeline on purpose: it measures whatever is
+// currently deployed, so it can be re-run during a demo without rebuilding, and
+// its console output is the artefact the audience reads.
+//
+// Both hosts are driven concurrently so the two runs share the same moment --
+// same region conditions, same network, nothing sequential to explain away.
+
+pipeline {
+    agent any
+
+    options {
+        timestamps()
+        ansiColor('xterm')
+        disableConcurrentBuilds()
+        buildDiscarder(logRotator(numToKeepStr: '30'))
+    }
+
+    parameters {
+        string(
+            name: 'DURATION_SECONDS',
+            defaultValue: '8',
+            description: 'Seconds each host saturates its cores. Clamped to 3-30 by the application. 8s keeps the whole job under 40s; measured spread at 10s was 0.4%, so there is margin to spare.'
+        )
+        string(
+            name: 'ROUNDS',
+            defaultValue: '3',
+            description: 'How many times to repeat. The median is reported, so an outlier cannot set the headline number.'
+        )
+    }
+
+    environment {
+        // On-demand Linux pricing, ap-southeast-1. Refreshed from the Price List
+        // API by the pipeline itself, with these as the fallback.
+        FALLBACK_X86_PRICE = '0.1960'
+        FALLBACK_ARM_PRICE = '0.1666'
+    }
+
+    stages {
+
+        stage('Check both hosts ready') {
+            steps {
+                script {
+                    def facts = sh(script: 'cat /etc/graviton-demo.env', returnStdout: true).trim()
+                    facts.split('\n').each { line ->
+                        def (k, v) = line.split('=', 2)
+                        env[k] = v
+                    }
+
+                    // Private addresses: the benchmark traffic never leaves the VPC,
+                    // so the load balancer is not in the measurement path.
+                    env.X86_IP = sh(
+                        script: """aws ec2 describe-instances --region ${env.DEMO_REGION} \
+                                     --instance-ids ${env.X86_INSTANCE_ID} \
+                                     --query 'Reservations[0].Instances[0].PrivateIpAddress' \
+                                     --output text""",
+                        returnStdout: true).trim()
+
+                    env.ARM_IP = sh(
+                        script: """aws ec2 describe-instances --region ${env.DEMO_REGION} \
+                                     --instance-ids ${env.ARM_INSTANCE_ID} \
+                                     --query 'Reservations[0].Instances[0].PrivateIpAddress' \
+                                     --output text""",
+                        returnStdout: true).trim()
+                }
+                sh '''
+                    echo "Intel    $X86_INSTANCE_ID  $X86_IP"
+                    echo "Graviton $ARM_INSTANCE_ID  $ARM_IP"
+                '''
+            }
+        }
+
+        stage('Confirm neither is busy') {
+            steps {
+                sh '''
+                    FAILED=0
+                    for PAIR in "$X86_IP:Intel" "$ARM_IP:Graviton"; do
+                      IP="${PAIR%%:*}"; NAME="${PAIR#*:}"
+                      BODY=$(curl -s --max-time 8 "http://$IP/Recommendations/Status" || echo '')
+
+                      if [ -z "$BODY" ]; then
+                        echo "FAIL  $NAME  no response from $IP"
+                        FAILED=1
+                        continue
+                      fi
+
+                      echo "$NAME  $(echo "$BODY" | jq -r '"\\(.architecture) / \\(.instanceType) / \\(.threads) vCPU"')"
+
+                      # A run already in flight would corrupt the measurement.
+                      if [ "$(echo "$BODY" | jq -r '.running')" = "true" ]; then
+                        echo "FAIL  $NAME  a pass is already running"
+                        FAILED=1
+                      fi
+                    done
+                    exit $FAILED
+                '''
+            }
+        }
+
+        stage('Fetch on-demand prices') {
+            steps {
+                script {
+                    // Real published prices, so the price/performance figure is
+                    // defensible rather than remembered.
+                    env.X86_PRICE = lookupPrice('c6i.xlarge', env.FALLBACK_X86_PRICE)
+                    env.ARM_PRICE = lookupPrice('c7g.xlarge', env.FALLBACK_ARM_PRICE)
+                    echo "c6i.xlarge \$${env.X86_PRICE}/hr    c7g.xlarge \$${env.ARM_PRICE}/hr"
+                }
+            }
+        }
+
+        stage('Run load on both hosts') {
+            steps {
+                script {
+                    def rounds = (params.ROUNDS as int)
+                    def duration = (params.DURATION_SECONDS as int)
+                    def results = []
+
+                    for (int round = 1; round <= rounds; round++) {
+                        echo "--- round ${round} of ${rounds} ---"
+
+                        // Both hosts start together, so neither run gets a quieter
+                        // moment than the other.
+                        parallel(
+                            'Intel': { startPass(env.X86_IP, duration) },
+                            'Graviton': { startPass(env.ARM_IP, duration) },
+                            failFast: true
+                        )
+
+                        // Poll rather than sleep-and-hope: the workers check the
+                        // deadline between passes, so a run can end slightly late.
+                        // Both hosts are waited on concurrently -- sequentially, the
+                        // second wait only begins once the first has been observed
+                        // finishing, adding its detection lag to every round.
+                        parallel(
+                            'Intel': { waitForIdle(env.X86_IP, duration) },
+                            'Graviton': { waitForIdle(env.ARM_IP, duration) },
+                            failFast: true
+                        )
+
+                        def x86 = readResult(env.X86_IP)
+                        def arm = readResult(env.ARM_IP)
+                        results << [round: round, x86: x86, arm: arm]
+
+                        echo String.format(
+                            "round %d   Intel %,d ops/sec   Graviton %,d ops/sec",
+                            round, x86.operationsPerSecond, arm.operationsPerSecond)
+
+                        if (round < rounds) {
+                            // Just enough for the previous round's threads to exit.
+                            sleep time: 2, unit: 'SECONDS'
+                        }
+                    }
+
+                    // writeJSON from pipeline-utility-steps, rather than
+                    // groovy.json.JsonOutput, which the Groovy sandbox may refuse.
+                    writeJSON file: 'benchmark-raw.json', json: results
+                    env.RESULT_COUNT = results.size().toString()
+                }
+            }
+        }
+
+        stage('Publish comparison report') {
+            steps {
+                // The renderer lives at CFN_Demo/jenkins/render-report.py rather
+                // than inline: embedded here it would sit inside a Groovy string
+                // inside a shell heredoc, three levels of quoting deep, where the
+                // HTML's own braces and quotes break very easily. It can also be
+                // run by hand against a saved benchmark-raw.json.
+                sh '''
+                    python3 /workspace/CFN_Demo/jenkins/render-report.py \
+                      benchmark-raw.json "$X86_PRICE" "$ARM_PRICE" \
+                      --html benchmark-report.html \
+                      | tee benchmark-report.txt
+                '''
+
+                archiveArtifacts artifacts: 'benchmark-report.txt,benchmark-report.html,benchmark-raw.json',
+                                 fingerprint: true
+
+                // Adds "Benchmark Report" to the build sidebar. keepAll so an
+                // earlier run's report stays available for a side-by-side look.
+                publishHTML(target: [
+                    reportName            : 'Benchmark Report',
+                    reportDir             : '.',
+                    reportFiles           : 'benchmark-report.html',
+                    keepAll               : true,
+                    alwaysLinkToLastBuild : true,
+                    allowMissing          : false
+                ])
+            }
+        }
+    }
+
+    post {
+        always {
+            script {
+                // Surface the headline on the build page itself, so the stage view
+                // carries the number without opening the console log.
+                if (fileExists('benchmark-report.txt')) {
+                    def report = readFile('benchmark-report.txt')
+                    def line = report.readLines().find { it.contains('Graviton faster by') }
+                    if (line) {
+                        currentBuild.description = line.trim()
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/** Published on-demand price, falling back to a committed value if the API is unreachable. */
+String lookupPrice(String instanceType, String fallback) {
+    def price = sh(
+        returnStdout: true,
+        script: """
+            set +e
+            aws pricing get-products --region us-east-1 \
+              --service-code AmazonEC2 \
+              --filters "Type=TERM_MATCH,Field=instanceType,Value=${instanceType}" \
+                        "Type=TERM_MATCH,Field=regionCode,Value=\$DEMO_REGION" \
+                        "Type=TERM_MATCH,Field=operatingSystem,Value=Linux" \
+                        "Type=TERM_MATCH,Field=tenancy,Value=Shared" \
+                        "Type=TERM_MATCH,Field=preInstalledSw,Value=NA" \
+                        "Type=TERM_MATCH,Field=capacitystatus,Value=Used" \
+              --max-results 1 --query 'PriceList[0]' --output text 2>/dev/null \
+              | jq -r '.terms.OnDemand | to_entries[0].value.priceDimensions | to_entries[0].value.pricePerUnit.USD' 2>/dev/null
+        """).trim()
+
+    if (price ==~ /^[0-9]+\.[0-9]+$/) {
+        return price
+    }
+    echo "Price List API unavailable for ${instanceType}; using committed fallback ${fallback}"
+    return fallback
+}
+
+void startPass(String ip, int duration) {
+    sh """curl -s -f -X POST --max-time 15 "http://${ip}/Recommendations/Start?seconds=${duration}" > /dev/null"""
+}
+
+/**
+ * Waits until the host reports idle.
+ *
+ * A single shell loop rather than Jenkins' waitUntil: waitUntil backs off
+ * exponentially from 2s, so it routinely sits idle for several seconds after a
+ * run has already finished, and it pays a process-spawn per probe. This sleeps
+ * through the known duration first -- nothing can possibly be finished before
+ * then -- and only then probes twice a second.
+ */
+void waitForIdle(String ip, int duration) {
+    timeout(time: duration + 60, unit: 'SECONDS') {
+        sh """
+            sleep ${duration}
+            for _ in \$(seq 1 120); do
+              if [ "\$(curl -s --max-time 5 'http://${ip}/Recommendations/Status' | jq -r '.running')" = "false" ]; then
+                exit 0
+              fi
+              sleep 0.5
+            done
+            echo "host ${ip} never returned to idle"
+            exit 1
+        """
+    }
+}
+
+Map readResult(String ip) {
+    def body = sh(
+        returnStdout: true,
+        script: """curl -s --max-time 8 "http://${ip}/Recommendations/Status" | jq -c '.lastResult'"""
+    ).trim()
+
+    if (!body || body == 'null') {
+        error "No result recorded by ${ip} -- the pass did not complete."
+    }
+    return readJSON(text: body)
+}

@@ -1,0 +1,361 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: This template creates EC2 instances inside an AutoScaling Group.
+Metadata:
+  'AWS::CloudFormation::Interface':
+    ParameterGroups:
+      - Label:
+          default: Required Parameters
+        Parameters:
+          - VPCId
+          - MountTargetSG
+          - ALBSecurityGroup
+          - InstanceSecurityGroups
+          - EC2InternalCommunicationSG
+          - PrivateSubnetIds
+          - PrivateSubnet1Id
+          - PrivateSubnet2Id
+          - PublicSubnetIds
+          - IamInstanceProfileArn
+          - IamInstanceRoleArn
+          - JenkinsAgentInstanceProfileArn
+          - CodeBuildIamRole
+          - EKSClusterName
+          - Ec2KeyPairName
+          - Ec2KeyPairID
+      - Label:
+          default: Optional Parameters
+        Parameters:
+          - InstanceType
+          - ImageId
+          - LaunchTemplateVersionNumber
+          - Ec2AutoscaleMinSize
+          - Ec2AutoscaleMaxSize
+          - Ec2AutoscaleDesiredCapacity
+          - JenkinsPort
+          - JenkinsInboundAgentPort
+
+Parameters:
+  VPCId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC ID in which all resources will be created
+  MountTargetSG:
+    Type: 'List<AWS::EC2::SecurityGroup::Id>'
+    Description: Security group for EFS mount target
+  ALBSecurityGroup:
+    Type: 'List<AWS::EC2::SecurityGroup::Id>'
+    Description: 'Security group for ALB'
+  InstanceSecurityGroups:
+    Type: 'List<AWS::EC2::SecurityGroup::Id>'
+    Description: List of security groups that will be attached to the EC2 instances
+  EC2InternalCommunicationSG:
+    Type: String
+    Description: Security groups that will be attached to the EC2 instances
+  Ec2KeyPairName:
+    Type: 'AWS::EC2::KeyPair::KeyName'
+    Description: Amazon EC2 Key pair name
+  Ec2KeyPairID:
+    Type: String
+    Description: Amazon EC2 Key pair ID
+  PrivateSubnetIds:
+    Type: 'List<AWS::EC2::Subnet::Id>'
+    Description: Private Subnets Ids of the VPC to which EC2 instances will be launched
+  PrivateSubnet1Id:
+    Type: String
+    Description: Id of Private Subnets 1 of the VPC to which EC2 instances will be launched
+  PrivateSubnet2Id:
+    Type: String
+    Description: Id of Private Subnets 2 of the VPC to which EC2 instances will be launched
+  PublicSubnetIds:
+    Type: 'List<AWS::EC2::Subnet::Id>'
+    Description: Public Subnets Ids of the VPC to which ALB and NAT-GWs will be launched
+  IamInstanceProfileArn:
+    Type: String
+    Description: Instance profile for the EC2 instance
+  IamInstanceRoleArn:
+    Type: String
+    Description: IAM Role ARN attached to Instance Profile
+  JenkinsAgentInstanceProfileArn:
+    Type: String
+    Description: IAM Role ARN attached to Jenkins Agent Nodes
+  EKSClusterName:
+    Type: String
+    Description: EKS Cluster name to which Jenkins will deploy
+
+  InstanceType:
+    Type: String
+    Default: t4g.xlarge
+    Description: Instance type that will be launched with the ASG
+  ImageId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    # Default: '/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2'
+    Default: '/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-arm64-gp2'
+    Description: Image id which will be used by ASG to launch EC2 instances
+  LaunchTemplateVersionNumber:
+    Default: 1
+    Type: String
+  Ec2AutoscaleMinSize:
+    Description: AutoScalingGroup MinSize
+    Type: String
+    Default: '1'
+  Ec2AutoscaleMaxSize:
+    Description: AutoScalingGroup MaxSize
+    Type: String
+    Default: '1'
+  Ec2AutoscaleDesiredCapacity:
+    Description: AutoScalingGroup DesiredCapacity
+    Type: String
+    Default: '1'
+  JenkinsPort:
+    Type: Number
+    Default: 8080
+
+  # KeyName:
+  #   Description: The EC2 Key Pair to allow SSH access to the instances
+  #   Type: 'AWS::EC2::KeyPair::KeyName'
+
+Resources:
+  FileSystem:
+    Type: AWS::EFS::FileSystem
+    Properties:
+      PerformanceMode: generalPurpose
+      FileSystemTags:
+      - Key: Name
+        Value: !Sub '${AWS::StackName}-CI/CD-FileSystem'
+  MountTarget1:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref FileSystem
+      SubnetId: !Select [ 0, !Ref PrivateSubnetIds ]
+      SecurityGroups: !Ref MountTargetSG
+  MountTarget2:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref FileSystem
+      SubnetId: !Select [ 1, !Ref PrivateSubnetIds ]
+      SecurityGroups: !Ref MountTargetSG
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub '${AWS::StackName}-launch-template-for-ASG'
+      LaunchTemplateData:
+        TagSpecifications: 
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: !Sub '${AWS::StackName}-Jenkis-Server'
+        NetworkInterfaces:
+          - Groups: !Ref InstanceSecurityGroups
+            DeviceIndex: 0
+            # AssociatePublicIpAddress: true
+        ImageId: !Ref ImageId
+        KeyName: !Ref Ec2KeyPairName
+        InstanceType: !Ref InstanceType
+        IamInstanceProfile:
+          Arn: !Ref IamInstanceProfileArn
+        MetadataOptions:
+          HttpTokens: required
+          HttpEndpoint: enabled
+          HttpPutResponseHopLimit: 2
+        UserData:
+          Fn::Base64:
+            !Sub |
+              #!/bin/bash
+              set -x
+              # Global Variables
+              Jenkins_Home='/var/lib/jenkins'
+              Jenkins_User='jenkins'
+              Sleep_Time=10
+              Max_Sleep_Time=600
+              ALB_DNS=${ApplicationLoadBalancer.DNSName}
+              export JENKINS_URL="http://$ALB_DNS"
+              if [[ $(uname -m) == 'aarch64' ]]; then export ARCH='arm64'; else export ARCH='amd64'; fi
+
+              # Dependency Softwares installation
+              wget -q -O /etc/yum.repos.d/jenkins.repo https://pkg.jenkins.io/redhat-stable/jenkins.repo
+              rpm --import https://pkg.jenkins.io/redhat-stable/jenkins.io.key
+              rpm --import https://pkg.jenkins.io/redhat-stable/jenkins.io-2023.key
+              yum update -y
+              sudo yum install java-17-amazon-corretto-devel -y
+              yum install -y amazon-efs-utils nfs-utils jenkins git docker jq
+              wget https://github.com/mikefarah/yq/releases/latest/download/yq_linux_$ARCH -O /usr/bin/yq && chmod +x /usr/bin/yq
+              curl -L -o /tmp/kubectl  "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/$ARCH/kubectl"
+              install -o root -g root -m 0755 /tmp/kubectl /usr/bin/kubectl
+              yum remove awscli -y
+              curl "https://awscli.amazonaws.com/awscli-exe-linux-$(uname -m).zip" -o "awscliv2.zip"
+              unzip -q awscliv2.zip
+              ./aws/install
+              ln /usr/local/bin/aws /usr/bin/aws
+              aws --version
+
+              # Configuring and enabling services
+              systemctl enable nfs docker --now
+              usermod -aG docker $Jenkins_User
+              echo "${FileSystem}.efs.${AWS::Region}.amazonaws.com:/ $Jenkins_Home nfs4 nfsvers=4.1,rsize=1048576,wsize=1048576,hard,timeo=600,retrans=2,noresvport,_netdev 0 0" >> /etc/fstab
+              for xx in $(seq 0 $Sleep_Time $Max_Sleep_Time); do
+                mount -a
+                if mount | grep -i ${FileSystem} >/dev/null 2>&1; then
+                  break
+                else
+                  sleep $Sleep_Time
+                fi
+              done
+              if [[ $(stat -c '%U' $Jenkins_Home) != $Jenkins_User ]]; then
+                chown -v $Jenkins_User:$Jenkins_User $Jenkins_Home
+              fi
+
+              # Configure Jenkins to run few system commands
+              cat <<EOF > /etc/sudoers.d/jenkins-users
+              jenkins ALL=(ALL) NOPASSWD:/usr/bin/systemctl enable docker *
+              jenkins ALL=(ALL) NOPASSWD:/usr/bin/docker *
+              jenkins ALL=(ALL) NOPASSWD:/usr/bin/yum install docker *
+              EOF
+
+              # Configuring Jenkins
+              sed -ie '/JAVA_OPTS/s/"[^"]*$/ -Djenkins.install.runSetupWizard=false"/' /usr/lib/systemd/system/jenkins.service
+              systemctl enable jenkins --now
+              # Referance Link https://gist.github.com/rowan-m/1026918/b6ea7a8db20d907329e5e539c4fa23b5d318b5b0
+              if [[ ! -d $Jenkins_Home/updates ]]; then mkdir -p $Jenkins_Home/updates; fi
+              if [[ -f $Jenkins_Home/updates/default.json ]]; then rm -f $Jenkins_Home/updates/default.json; fi
+              wget -q -O $Jenkins_Home/updates/default.json http://updates.jenkins-ci.org/update-center.json?version=$(grep "<version>" $Jenkins_Home/config.xml | awk -F '[<>]' '{print $3}')
+              sed -i '1d;$d' $Jenkins_Home/updates/default.json
+              chown -R $Jenkins_User:$Jenkins_User $Jenkins_Home/updates
+              systemctl restart jenkins.service
+              for xx in $(seq 0 $Sleep_Time $Max_Sleep_Time); do
+                if [[ $(curl -s -o /dev/null -w "%{http_code}" $JENKINS_URL/login) -eq 200 ]]; then
+                  break
+                else
+                  sleep $Sleep_Time
+                fi
+              done
+              wget $JENKINS_URL/jnlpJars/jenkins-cli.jar
+              # Install plugins with proper authentication and error handling
+              JENKINS_ADMIN_PASSWORD=$(aws ssm get-parameter --name Jenkins-Password --query 'Parameter.Value' --output text --with-decryption --region ${AWS::Region})
+              java -jar jenkins-cli.jar -s http://localhost:8080 install-plugin \
+                git github workflow-aggregator metrics cloudbees-folder pipeline-stage-view \
+                pipeline-github-lib github-branch-source credentials-binding timestamper \
+                pipeline-model-definition build-timeout ec2 configuration-as-code-secret-ssm \
+                ws-cleanup gradle antisamy-markup-formatter ssh-slaves matrix-auth pam-auth pipeline-aws
+              # Wait for plugin installation to complete
+              sleep 30
+              # Copy JCasC file to $JENKINS_HOME/jenkins.yaml so that it is loaded after the service restart
+              wget -q -O $Jenkins_Home/jenkins.yaml https://raw.githubusercontent.com/santosh-at-github/dotnet_on_graviton/main/Jenkins_Config/JenkinsCasC.yaml
+              # sed -ie "s/<ENV_ALB_DNS>/$ALB_DNS/g" $Jenkins_Home/jenkins.yaml
+              sed -i -e "s/Ec2KeyPairID/${Ec2KeyPairID}/g" \
+                -e "s/AWS_REGION/${AWS::Region}/g" \
+                -e "s/AL2_X86_64_AMI_ID/$(aws ssm get-parameters --names /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-ebs --query Parameters[*].Value --output text --region ${AWS::Region})/g" \
+                -e "s/AL2_ARM64_AMI_ID/$(aws ssm get-parameters --names /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-arm64-gp2 --query Parameters[*].Value --output text --region ${AWS::Region})/g" \
+                -e "s|JENKINS_AGENT_INSTANCE_PROFILE|${JenkinsAgentInstanceProfileArn}|g" \
+                -e "s/JENKINS_AGENT_SG/${EC2InternalCommunicationSG}/g" \
+                -e "s/JENKINS_AGENT_SUBNETS/${PrivateSubnet1Id}, ${PrivateSubnet2Id}/g" \
+                $Jenkins_Home/jenkins.yaml
+              yq -i ".unclassified.gitHubPluginConfig.hookUrl=\"http://$ALB_DNS/github-webhook/\"" $Jenkins_Home/jenkins.yaml
+              yq -i ".unclassified.location.url=\"http://$ALB_DNS/\"" $Jenkins_Home/jenkins.yaml
+              yq -i ".jenkins.globalNodeProperties[0].envVars.env[0] = {\"key\": \"ECR_Repo\", \"value\": \"${ECRRepository.RepositoryUri}\"}" $Jenkins_Home/jenkins.yaml
+              yq -i ".jenkins.globalNodeProperties[0].envVars.env[1] = {\"key\": \"EKS_Cluster\", \"value\": \"${EKSClusterName}\"}" $Jenkins_Home/jenkins.yaml
+              yq -i ".jenkins.globalNodeProperties[0].envVars.env[2] = {\"key\": \"DockerImage\", \"value\": \"${ECRRepository.RepositoryUri}:\$BUILD_ID\"}" $Jenkins_Home/jenkins.yaml
+              yq -i ".jenkins.globalNodeProperties[0].envVars.env[3] = {\"key\": \"EC2SSHKey\", \"value\": \"${Ec2KeyPairID}\"}" $Jenkins_Home/jenkins.yaml
+              chown $Jenkins_User:$Jenkins_User $Jenkins_Home/jenkins.yaml
+              # java -jar jenkins-cli.jar restart
+              systemctl restart jenkins
+
+  AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      MinSize: !Ref Ec2AutoscaleMinSize
+      MaxSize: !Ref Ec2AutoscaleMaxSize
+      DesiredCapacity: !Ref Ec2AutoscaleDesiredCapacity
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        # Version: !Ref LaunchTemplateVersionNumber
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+      VPCZoneIdentifier: !Ref PrivateSubnetIds
+      TargetGroupARNs:
+      - !Ref ALBTargetGroupMain
+
+  HTTPListenerMain:
+    Type: "AWS::ElasticLoadBalancingV2::Listener"
+    Properties:
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions: 
+      - Order: 1
+        TargetGroupArn: !Ref ALBTargetGroupMain
+        Type: "forward"
+  ALBTargetGroupMain:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      HealthCheckIntervalSeconds: 30
+      HealthCheckProtocol: HTTP
+      HealthCheckTimeoutSeconds: 15
+      HealthyThresholdCount: 3
+      UnhealthyThresholdCount: 2
+      HealthCheckPath: /login
+      Port: !Ref JenkinsPort
+      Protocol: HTTP
+      TargetGroupAttributes:
+      - Key: deregistration_delay.timeout_seconds
+        Value: '20'
+      TargetType: instance
+      VpcId: !Ref VPCId
+  ApplicationLoadBalancer:
+    Type: 'AWS::ElasticLoadBalancingV2::LoadBalancer'
+    Properties:
+      # Name: !Sub '${AWS::StackName}-jenkins-alb'
+      Scheme: internet-facing
+      Type: application
+      Subnets: !Ref PublicSubnetIds
+      SecurityGroups: !Ref ALBSecurityGroup
+      IpAddressType: ipv4
+
+  ECRRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryPolicyText:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: "AllowPushPull"
+            Effect: Allow
+            Principal:
+              AWS: !Ref IamInstanceRoleArn
+            Action:
+              - "ecr:GetDownloadUrlForLayer"
+              - "ecr:BatchGetImage"
+              - "ecr:BatchCheckLayerAvailability"
+              - "ecr:PutImage"
+              - "ecr:InitiateLayerUpload"
+              - "ecr:UploadLayerPart"
+              - "ecr:CompleteLayerUpload"
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+            {
+              "rulePriority": 1,
+              "description": "Only keep 6 images",
+              "selection": {
+                "tagStatus": "untagged",
+                "countType": "imageCountMoreThan",
+                "countNumber": 6
+              },
+              "action": { "type": "expire" }
+            }, {
+              "rulePriority": 2,
+              "description": "Expire images older than 7 days",
+              "selection": {
+                  "tagStatus": "any",
+                  "countType": "sinceImagePushed",
+                  "countUnit": "days",
+                  "countNumber": 7
+              },
+              "action": { "type": "expire" }
+            }]
+          }
+
+Outputs:
+  ECRRepository:
+    Description: ECR repository Uri
+    Value: !GetAtt ECRRepository.RepositoryUri
+  AlbDns:
+    Description: ALB DNS to access Jenkins portal
+    Value: !Sub ${ApplicationLoadBalancer.DNSName}

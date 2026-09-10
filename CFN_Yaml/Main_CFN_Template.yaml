@@ -1,0 +1,171 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: This template launches verity of AWS resources needed to host Gadgets Online .NET application
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: Production
+    Description: An environment name that is prefixed to resource names
+  StackTemplateLocation:
+    Type: String
+    Default: 'https://s3.amazonaws.com/my-dynamic-test-bucket/GadgetsOnlineTemplates/'
+    Description: URL where all the required CFN stack templates have been saved.'
+  EKSNodeInstanceType:
+    Type: String
+    Default: 'm6g.xlarge'
+    Description: EKS Worker node Instance type
+  EKSNodeAmiType:
+    Type: String
+    Description: 'EKS Nodegroup AMI Type'
+    Default: AL2_ARM_64
+  JenkinsInstanceType:
+    Type: String
+    Description: 'Instance type for Jenkins Instance'
+    Default: t4g.xlarge
+  EKSKubernetesVersion:
+    Type: String
+    Description: EKS Kubernetes Version
+    Default: '1.27'
+  EKSClusterName:
+    Type: String
+    Description: EKS Cluster name
+    Default: GadgetsOnline
+
+Resources:
+  VPC:
+    Type: 'AWS::CloudFormation::Stack'
+    Properties:
+      TemplateURL: !Join [ '', [ !Ref StackTemplateLocation, '/CFN_Yaml/VpcResources.yaml']]
+      TimeoutInMinutes: '5'
+      Parameters:
+        EnvironmentName: !Ref EnvironmentName
+  
+  IamStack:
+    Type: 'AWS::CloudFormation::Stack'
+    Properties:
+      TemplateURL: !Join [ '', [ !Ref StackTemplateLocation, '/CFN_Yaml/Iam_resources.yaml']]
+      TimeoutInMinutes: '5'
+  
+  JenkinsEnvStack:
+    Type: 'AWS::CloudFormation::Stack'
+    Properties:
+      TemplateURL: !Join [ '', [ !Ref StackTemplateLocation, '/CFN_Yaml/JenkinsEnv.yaml']]
+      TimeoutInMinutes: '10'
+      Parameters:
+        VPCId: !GetAtt
+        - VPC
+        - Outputs.VPC
+        MountTargetSG: !GetAtt
+        - VPC
+        - Outputs.MountTargetSG
+        ALBSecurityGroup: !GetAtt
+        - VPC
+        - Outputs.ALBSecurityGroup
+        InstanceSecurityGroups: !Join [',', [!GetAtt [VPC, Outputs.EC2InternalCommunicationSG], !GetAtt [VPC, Outputs.EC2WebAccessSG]]]
+        PrivateSubnetIds: !GetAtt [VPC, Outputs.PrivateSubnets]
+        PublicSubnetIds: !GetAtt [VPC, Outputs.PublicSubnets]
+        IamInstanceProfileArn: !GetAtt
+        - IamStack
+        - Outputs.JenkinsInstanceProfile
+        IamInstanceRoleArn: !GetAtt
+        - IamStack
+        - Outputs.JenkinsInstanceRole
+        EKSClusterName: !GetAtt
+        - EKSClusterStack
+        - Outputs.ClusterStackName
+        InstanceType: !Ref JenkinsInstanceType
+        Ec2KeyPairName: !GetAtt
+        - VPC
+        - Outputs.Ec2KeyPairName
+        Ec2KeyPairID: !GetAtt
+        - VPC
+        - Outputs.Ec2KeyPairID
+        JenkinsAgentInstanceProfileArn: !GetAtt
+        - IamStack
+        - Outputs.JenkinsAgentInstanceProfile
+        EC2InternalCommunicationSG: !GetAtt
+        - VPC
+        - Outputs.EC2InternalCommunicationSG
+        PrivateSubnet1Id: !GetAtt
+        - VPC
+        - Outputs.PrivateSubnet1
+        PrivateSubnet2Id: !GetAtt
+        - VPC
+        - Outputs.PrivateSubnet2
+
+  EKSClusterStack:
+    Type: 'AWS::CloudFormation::Stack'
+    Properties:
+      TemplateURL: !Join [ '', [ !Ref StackTemplateLocation, '/CFN_Yaml/EKSCluster.yaml']]
+      TimeoutInMinutes: '15'
+      Parameters:
+        ControlPlaneSecurityGroup: !GetAtt
+        - VPC
+        - Outputs.ControlPlaneSecurityGroup
+        SubnetsList: !Join [',', [!GetAtt [VPC, Outputs.PrivateSubnets], !GetAtt [VPC, Outputs.PublicSubnets]]]
+        EKSServiceRoleArn: !GetAtt
+        - IamStack
+        - Outputs.EKSServiceRoleArn
+        EKSKubernetesVersion: !Ref EKSKubernetesVersion
+        EKSClusterName: !Ref EKSClusterName
+  
+  EKSm6gxlNodeGroupStack:
+    Type: 'AWS::CloudFormation::Stack'
+    Properties:
+      TemplateURL: !Join [ '', [ !Ref StackTemplateLocation, '/CFN_Yaml/EKSClusterNodeGroup.yaml']]
+      TimeoutInMinutes: '10'
+      Parameters:
+        PrivateSubnets: !GetAtt
+        - VPC
+        - Outputs.PrivateSubnets
+        ClusterSecurityGroupId: !GetAtt
+        - EKSClusterStack
+        - Outputs.ClusterSecurityGroupId
+        EKSClusterName: !Ref EKSClusterName
+        EKSNodeInstanceType: !Ref EKSNodeInstanceType
+        EKSNodeInstanceRole: !GetAtt
+        - IamStack
+        - Outputs.EKSNodeInstanceRole
+        EKSNodeAmiType: !Ref EKSNodeAmiType
+  EKSm5xlNodeGroupStack:
+    Type: 'AWS::CloudFormation::Stack'
+    Properties:
+      TemplateURL: !Join [ '', [ !Ref StackTemplateLocation, '/CFN_Yaml/EKSClusterNodeGroup.yaml']]
+      TimeoutInMinutes: '10'
+      Parameters:
+        PrivateSubnets: !GetAtt
+        - VPC
+        - Outputs.PrivateSubnets
+        ClusterSecurityGroupId: !GetAtt
+        - EKSClusterStack
+        - Outputs.ClusterSecurityGroupId
+        EKSClusterName: !Ref EKSClusterName
+        EKSNodeInstanceType: 'm5.xlarge'
+        EKSNodeInstanceRole: !GetAtt
+        - IamStack
+        - Outputs.EKSNodeInstanceRole
+        EKSNodeAmiType: 'AL2_x86_64'
+
+Outputs:
+  JenkinsURL:
+    Description: ALB DNS Name to access Jenkins
+    Value: !GetAtt
+    - JenkinsEnvStack
+    - Outputs.AlbDns
+
+
+# References and comments:
+  # cat TestResult_C5_x86_withDB_ConcurTG.jtl | sed '1d' | awk -F',' '{ a[strftime("%Y%m%dT%H:%M:%S",$1/1000)]++ } END{ for (i in a) print i,a[i] }
+  # Kube Ops View: https://codeberg.org/hjacobs/kube-ops-view
+  # Metrics Server Installation: https://docs.aws.amazon.com/eks/latest/userguide/metrics-server.html
+  # Scale Deployment using HPA: https://docs.aws.amazon.com/eks/latest/userguide/horizontal-pod-autoscaler.html#hpa-sample-app
+  # Creating OIDC provider: https://docs.aws.amazon.com/eks/latest/userguide/enable-iam-roles-for-service-accounts.html
+  # Cluster Autoscaler Prerequisites: https://docs.aws.amazon.com/eks/latest/userguide/autoscaling.html
+  # Taints and Tolerations Example: https://www.densify.com/kubernetes-autoscaling/kubernetes-taints/
+  # Node Affinity example: https://www.howtoforge.com/use-node-affinity-in-kubernetes/
+  # Load Generator: kubectl run load-generator --restart=Never --image=alpine -- sh -c 'while true; do wget -q -o /dev/null http://ac6259bd8880d47a999e44cb39d033ee-1019741493.ap-south-1.elb.amazonaws.com/ 2>&1; done'
+  # Karpenter
+  # eksctl utils associate-iam-oidc-provider --cluster my-cluster --approve
+  # eksctl create iamserviceaccount --name karpenter --namespace karpenter --cluster ${CLUSTER_NAME}  --role-name ${CLUSTER_NAME}-karpenter --attach-policy-arn arn:aws:iam::${AWS_ACCOUNT_ID}:policy/KarpenterControllerPolicy-${CLUSTER_NAME} --approve --override-existing-serviceaccounts
+  # docker logout public.ecr.aws
+  # helm registry logout public.ecr.aws
+  # Then use "helm upgrade --install karpenter" command from https://karpenter.sh/v0.27.0/getting-started/getting-started-with-eksctl/

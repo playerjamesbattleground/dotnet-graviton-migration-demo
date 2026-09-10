@@ -1,0 +1,75 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><style>
+* { margin:0; box-sizing:border-box; }
+body { width:1280.0px; height:720.0px; position:relative;
+        background:#fff; font-family:Arial, Helvetica, sans-serif; overflow:hidden; }
+.bar { position:absolute; left:0; top:0; width:17.3px;
+        height:720.0px; background:#FF9900; }
+.kicker { position:absolute; left:57.6px; top:40.3px;
+           font-size:13.3px; font-weight:700; color:#888888; letter-spacing:1.2px; }
+.title { position:absolute; left:55.7px; top:69.1px;
+          font-size:34.6px; font-weight:700; color:#232F3E; }
+.subtitle { position:absolute; left:57.6px; top:136.3px;
+             font-size:18px; color:#555555; }
+svg { position:absolute; left:0; top:0; width:100%; height:100%; }
+svg line { stroke-width:2.3; marker-end:url(#a); }
+.node { position:absolute; background:#F5F7FA; border:1px solid #E5E7EB;
+         border-radius:7px; display:flex; align-items:center; }
+.chip { position:absolute; left:0; top:9px; bottom:9px; width:5px;
+         border-radius:2px 0 0 2px; }
+.ico { margin-left:25px; width:50px; height:50px; }
+.ntext { margin-left:14px; display:flex; flex-direction:column; }
+.ntext b { font-size:15.3px; color:#232F3E; }
+.ntext span { font-size:12.6px; color:#555555; margin-top:3px; }
+.badge { position:absolute; left:328.3px; top:332.2px; width:100.8px; height:40.3px;
+          background:#FF9900; border-radius:21px; color:#fff; text-align:center;
+          display:flex; flex-direction:column; justify-content:center; }
+.badge b { font-size:14.6px; }
+.badge span { font-size:11.3px; font-weight:700; }
+.results { position:absolute; left:1060.8px; top:411.8px;
+            width:161.6px; height:121.9px; background:#FFF4EC;
+            border:1px solid #FF9900; border-radius:7px; }
+.results img { position:absolute; left:17px; top:29px; width:44px; height:44px; }
+.stat { position:absolute; display:flex; flex-direction:column; }
+.stat b { font-size:34.6px; font-weight:700; color:#FF9900; line-height:1; }
+.stat span { font-size:10px; font-weight:700; color:#555555; margin-top:3px; }
+.footer { position:absolute; left:57.6px; top:635.5px;
+           width:1164.5px; font-size:12.6px; color:#888888; }
+</style></head><body>
+<div class="bar"></div>
+<div class="kicker">GADGETSONLINE  ·  AWS GRAVITON BUSINESS CASE</div>
+<div class="title">One codebase. Two processors.</div>
+<div class="subtitle">Two lines of configuration decide which chip runs it — nothing else changes</div>
+<svg><defs><marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="5"
+  markerHeight="5" orient="auto-start-reverse">
+  <path d="M0,1 L9,5 L0,9 z" fill="context-stroke"/></marker></defs><line x1="672.0" y1="290.40000000000003" x2="792.0" y2="290.40000000000003" stroke="#0073BB"/><line x1="316.8" y1="381.59999999999997" x2="436.79999999999995" y2="290.40000000000003" stroke="#0073BB"/><line x1="672.0" y1="472.79999999999995" x2="792.0" y2="472.79999999999995" stroke="#FF9900"/><line x1="316.8" y1="381.59999999999997" x2="436.79999999999995" y2="472.79999999999995" stroke="#FF9900"/></svg>
+
+<div class="node" style="left:81.6px;top:326.4px;width:235.2px;height:110.4px">
+  <span class="chip" style="background:#232F3E"></span>
+  <img src="file:///Users/jjiangl/workspace/ws_amazon/sa2026/Icon-package_07312026.5846e92413caa21490223536cc97f1269e44fa92/Resource-Icons_07312026/Res_General-Icons/Res_48_Light/Res_Source-Code_48_Light.png" class="ico">
+  <div class="ntext"><b>Application source</b><span>one repository, one commit</span></div>
+</div>
+<div class="node" style="left:436.8px;top:235.2px;width:235.2px;height:110.4px">
+  <span class="chip" style="background:#0073BB"></span>
+  <img src="file:///Users/jjiangl/workspace/ws_amazon/sa2026/Icon-package_07312026.5846e92413caa21490223536cc97f1269e44fa92/Architecture-Service-Icons_07312026/Arch_Containers/64/Arch_Amazon-Elastic-Container-Registry_64.png" class="ico">
+  <div class="ntext"><b>Container image</b><span>built for x86_64</span></div>
+</div>
+<div class="node" style="left:792.0px;top:235.2px;width:235.2px;height:110.4px">
+  <span class="chip" style="background:#0073BB"></span>
+  <img src="file:///Users/jjiangl/workspace/ws_amazon/sa2026/Icon-package_07312026.5846e92413caa21490223536cc97f1269e44fa92/Architecture-Service-Icons_07312026/Arch_Compute/64/Arch_Amazon-EC2_64.png" class="ico">
+  <div class="ntext"><b>Amazon EC2  ·  c6i.xlarge</b><span>Intel Xeon, 4 vCPU</span></div>
+</div>
+<div class="node" style="left:436.8px;top:417.6px;width:235.2px;height:110.4px">
+  <span class="chip" style="background:#FF9900"></span>
+  <img src="file:///Users/jjiangl/workspace/ws_amazon/sa2026/Icon-package_07312026.5846e92413caa21490223536cc97f1269e44fa92/Architecture-Service-Icons_07312026/Arch_Containers/64/Arch_Amazon-Elastic-Container-Registry_64.png" class="ico">
+  <div class="ntext"><b>Container image</b><span>built for arm64</span></div>
+</div>
+<div class="node" style="left:792.0px;top:417.6px;width:235.2px;height:110.4px">
+  <span class="chip" style="background:#FF9900"></span>
+  <img src="file:///Users/jjiangl/workspace/ws_amazon/sa2026/Icon-package_07312026.5846e92413caa21490223536cc97f1269e44fa92/Architecture-Service-Icons_07312026/Arch_Compute/64/Arch_Amazon-EC2_64.png" class="ico">
+  <div class="ntext"><b>Amazon EC2  ·  c7g.xlarge</b><span>AWS Graviton3, 4 vCPU</span></div>
+</div>
+<div class="badge"><b>2 lines</b><span>changed</span></div>
+<div class="results"><img src="file:///Users/jjiangl/workspace/ws_amazon/sa2026/Icon-package_07312026.5846e92413caa21490223536cc97f1269e44fa92/Architecture-Service-Icons_07312026/Arch_Cloud-Financial-Management/64/Arch_AWS-Cost-Explorer_64.png"></div>
+<div class="stat" style="left:1132.8px;top:433.0px"><b>30%</b><span>FASTER</span></div><div class="stat" style="left:1211.5px;top:433.0px"><b>35%</b><span>LOWER COST</span></div>
+<div class="footer">Measured on this application: 4 vCPU each, same availability zone, median of 3 rounds. Prices are published on-demand Linux rates.</div>
+</body></html>

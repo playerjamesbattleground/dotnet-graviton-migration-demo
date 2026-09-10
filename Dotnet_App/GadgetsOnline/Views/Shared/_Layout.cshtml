@@ -1,0 +1,159 @@
+﻿<!DOCTYPE html>
+<html>
+<head>
+    <title>@ViewBag.Title</title>
+    <link href="@Url.Content("~/Content/Site.css")" rel="stylesheet"
+          type="text/css" />
+    <script src="@Url.Content("~/Scripts/jquery-1.4.4.min.js")"
+            type="text/javascript"></script>
+</head>
+<body>
+    <div id="header" style="margin-top:10px">
+
+        <h1 class="font-italic"><a href="/">
+            Welcome to Gadgets Online!
+             </a>
+        </h1>
+
+        <ul id="navlist">
+            @if (User.Identity.IsAuthenticated)
+            {
+<li><a>Welcome @User.Identity.Name</a></li>}
+            <li><a href="@Url.Content("~/Home")" id="current">Home</a></li>
+            <li><a href="@Url.Content("~/ShoppingCart")">ShoppingCart</a></li>            
+        </ul>
+    </div>
+
+    @*@{Html.RenderAction("CategoryMenu", "Store");}*@ @*OLD*@
+    @await Component.InvokeAsync("CategoryMenu")
+
+    <div id="main">
+        @RenderBody()
+    </div>
+
+    <div id="footer">
+        <a href="https://aws.amazon.com/developer/language/net/"> AWS &#10084;&#65039;  ASP.NET </a>
+    </div>
+    @*
+        Performance readout, sized to be legible on a projector from the back of a
+        room. Sits in the corner and stays dim while idle so it does not compete
+        with the storefront; brightens and fills its progress bar while a
+        personalisation pass runs.
+
+        This replaces the 10px, 30%-opacity strip that used to sit above the
+        footer: it carried the same architecture and instance type, and neither
+        was readable projected.
+    *@
+    <div id="perf-hud" style="position: fixed; bottom: 16px; right: 16px; z-index: 999;
+                              min-width: 288px;
+                              font-family: Consolas, Menlo, monospace;
+                              text-align: right; padding: 14px 18px 13px;
+                              border-radius: 9px;
+                              background: rgba(255, 255, 255, 0.72);
+                              border: 1px solid rgba(21, 20, 21, 0.10);
+                              color: rgba(21, 20, 21, 0.42);
+                              transition: background 0.25s, color 0.25s, border-color 0.25s;">
+
+        @*
+            Every value here is fixed for the life of the process -- architecture,
+            instance identity, core count, installed memory -- so all of it is
+            rendered server-side. It was briefly populated over AJAX, which was
+            both unnecessary and fragile: it left the panel showing placeholders
+            whenever the script failed to run.
+        *@
+        <div style="font-size: 26px; font-weight: 700; letter-spacing: -0.8px;">
+            @GadgetsOnline.Services.Platform.Architecture
+        </div>
+
+        <div style="font-size: 13px; font-weight: 700; margin-top: 5px; letter-spacing: -0.2px;">
+            @GadgetsOnline.Services.Platform.InstanceType &nbsp;|&nbsp; @GadgetsOnline.Services.Platform.InstanceId
+        </div>
+
+        <div style="font-size: 13px; margin-top: 2px;">
+            key spec: @System.Environment.ProcessorCount cores &nbsp;|&nbsp; @GadgetsOnline.Services.Platform.Memory
+        </div>
+    </div>
+
+    <script type="text/javascript">
+        // Only what actually changes while the page is open: starting a pass, and
+        // the panel's appearance while one runs. The panel's contents are static
+        // and rendered above by Razor.
+        var GadgetsPerf = (function ($) {
+            var pollTimer = null;
+            // Idle is legible but recessive; live is high contrast, so a glance
+            // from across a room tells you whether a pass is running.
+            var IDLE_COLOUR = 'rgba(21, 20, 21, 0.42)';
+            var IDLE_BG     = 'rgba(255, 255, 255, 0.72)';
+            var IDLE_BORDER = 'rgba(21, 20, 21, 0.10)';
+            var LIVE_COLOUR = '#151415';
+            var LIVE_BG     = 'rgba(255, 244, 236, 0.97)';
+            var LIVE_BORDER = 'rgba(207, 95, 22, 0.55)';
+
+            function setLive(isLive) {
+                var hud = $('#perf-hud');
+                hud.css('color', isLive ? LIVE_COLOUR : IDLE_COLOUR);
+                hud.css('background', isLive ? LIVE_BG : IDLE_BG);
+                hud.css('border-color', isLive ? LIVE_BORDER : IDLE_BORDER);
+            }
+
+            function render(status) {
+                // The panel's colour is the only run indicator.
+                setLive(status.running);
+            }
+
+            function poll() {
+                $.ajax({
+                    url: '/Recommendations/Status',
+                    dataType: 'json',
+                    cache: false,
+                    success: function (status) {
+                        render(status);
+                        if (!status.running) {
+                            stopPolling();
+                            $('#find-gadget-button').removeAttr('disabled').val('Find My Perfect Gadget');
+                        }
+                    },
+                    error: stopPolling
+                });
+            }
+
+            function stopPolling() {
+                if (pollTimer !== null) {
+                    clearInterval(pollTimer);
+                    pollTimer = null;
+                }
+            }
+
+            return {
+                start: function () {
+                    var button = $('#find-gadget-button');
+                    button.attr('disabled', 'disabled').val('Personalising…');
+
+                    $.ajax({
+                        type: 'POST',
+                        url: '/Recommendations/Start',
+                        dataType: 'json',
+                        success: function (status) {
+                            render(status);
+                            stopPolling();
+                            // Four times a second: fast enough that the counter
+                            // looks live, slow enough not to perturb the workload.
+                            pollTimer = setInterval(poll, 250);
+                        },
+                        error: function () {
+                            button.removeAttr('disabled').val('Find My Perfect Gadget');
+                        }
+                    });
+
+                    return false;
+                },
+                refresh: poll
+            };
+        })(jQuery);
+
+        // One probe on load, so a pass already in flight when the page opens is
+        // reflected in the panel rather than showing as idle.
+        jQuery(document).ready(function () { GadgetsPerf.refresh(); });
+    </script>
+</body>
+</html>

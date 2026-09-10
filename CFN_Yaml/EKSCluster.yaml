@@ -1,0 +1,98 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: 'EKS cluster Stack'
+
+Parameters:
+  ControlPlaneSecurityGroup:
+    Description: Security Group for the Control Plane
+    Type: 'List<AWS::EC2::SecurityGroup::Id>'
+  SubnetsList:
+    Type: 'List<AWS::EC2::Subnet::Id>'
+    Description: List of Subnets Ids of the VPC to which EKS Cluster will be created
+  EKSServiceRoleArn:
+    Type: String
+    Description: EKS service Role ARN
+  EKSKubernetesVersion:
+    Type: String
+    Description: EKS Kubernetes Version
+    Default: '1.31'
+  EKSClusterName:
+    Type: String
+    Description: EKS Cluster name
+    Default: GadgetsOnline
+
+Resources:
+  EksAutoNodeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${EKSClusterName}-eks-auto-node-role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - eks-auto.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEKSNodePolicy
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+        - arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess
+
+  ControlPlane:
+    Type: 'AWS::EKS::Cluster'
+    Properties:
+      Name: !Ref EKSClusterName
+      ResourcesVpcConfig:
+        EndpointPrivateAccess: false
+        EndpointPublicAccess: true
+        SecurityGroupIds: !Ref ControlPlaneSecurityGroup
+        SubnetIds: !Ref SubnetsList
+      RoleArn: !Ref EKSServiceRoleArn
+      AccessConfig:
+        AuthenticationMode: API_AND_CONFIG_MAP
+      Compute:
+        Type: AUTO
+        AutoModeConfig:
+          Enabled: true
+        NodeMode: AUTO
+        AutoModeNodeRoleArn: !GetAtt EksAutoNodeRole.Arn
+        NodePools:
+          - general-purpose
+          - system
+      BlockStorage:
+        Enabled: true
+      UpgradePolicy:
+        KubernetesVersion: STANDARD
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}/ControlPlane'
+      Version: !Ref EKSKubernetesVersion
+
+
+
+Outputs:
+  ARN:
+    Value: !GetAtt 
+      - ControlPlane
+      - Arn
+    Export:
+      Name: !Sub '${AWS::StackName}::ARN'
+  CertificateAuthorityData:
+    Value: !GetAtt 
+      - ControlPlane
+      - CertificateAuthorityData
+  ClusterSecurityGroupId:
+    Value: !GetAtt 
+      - ControlPlane
+      - ClusterSecurityGroupId
+    Export:
+      Name: !Sub '${AWS::StackName}::ClusterSecurityGroupId'
+  ClusterStackName:
+    Value: !Ref ControlPlane
+  Endpoint:
+    Value: !GetAtt 
+      - ControlPlane
+      - Endpoint
+    Export:
+      Name: !Sub '${AWS::StackName}::Endpoint'

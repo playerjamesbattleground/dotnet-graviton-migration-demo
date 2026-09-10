@@ -1,0 +1,445 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Template to Create IAM Resources
+Resources:
+  JenkinsInstanceProfile:
+    Type: 'AWS::IAM::InstanceProfile'
+    Properties:
+      Roles:
+        - !Ref JenkinsInstanceRole
+  JenkinsInstanceRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      # RoleName: !Sub '${AWS::StackName}-${AWS::Region}-EC2-Instance-Role'
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+                - codebuild.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - >-
+          arn:aws:iam::aws:policy/EC2InstanceProfileForImageBuilderECRContainerBuilds
+        - 'arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore'
+      Policies:
+        - PolicyName: ssm-secrets-access
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'ssm:GetParameter'
+                  - 'ssm:GetParameters'
+                  - 'ssm:GetParametersByPath'
+                Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/*'
+        - PolicyName: eks-readonly-access
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'eks:List*'
+                  - 'eks:Describe*'
+                Resource: '*'
+        - PolicyName: ec2-access-for-jenkins
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Resource: '*'
+                Action:
+                  - 'ec2:DescribeSpotInstanceRequests'
+                  - 'ec2:CancelSpotInstanceRequests'
+                  - 'ec2:GetConsoleOutput'
+                  - 'ec2:RequestSpotInstances'
+                  - 'ec2:RunInstances'
+                  - 'ec2:StartInstances'
+                  - 'ec2:StopInstances'
+                  - 'ec2:TerminateInstances'
+                  - 'ec2:CreateTags'
+                  - 'ec2:DeleteTags'
+                  - 'ec2:DescribeInstances'
+                  - 'ec2:DescribeInstanceTypes'
+                  - 'ec2:DescribeKeyPairs'
+                  - 'ec2:DescribeRegions'
+                  - 'ec2:DescribeImages'
+                  - 'ec2:DescribeAvailabilityZones'
+                  - 'ec2:DescribeSecurityGroups'
+                  - 'ec2:DescribeSubnets'
+                  - 'iam:ListInstanceProfilesForRole'
+                  - 'iam:PassRole'
+                  - 'ec2:GetPasswordData'
+  JenkinsAgentProfile:
+    Type: 'AWS::IAM::InstanceProfile'
+    Properties:
+      Roles:
+        - !Ref JenkinsAgentRole
+  JenkinsAgentRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      # RoleName: !Sub '${AWS::StackName}-${AWS::Region}-Jenkins-Agent-Role'
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - >-
+          arn:aws:iam::aws:policy/EC2InstanceProfileForImageBuilderECRContainerBuilds
+        - 'arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore'
+      Policies:
+        - PolicyName: ssm-secrets-access
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'ssm:GetParameter'
+                  - 'ssm:GetParameters'
+                  - 'ssm:GetParametersByPath'
+                Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/*'
+  EKSServiceRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action:
+              - 'sts:AssumeRole'
+            Effect: Allow
+            Principal:
+              Service:
+                - eks.amazonaws.com
+        Version: 2012-10-17
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AmazonEKSClusterPolicy'
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AmazonEKSVPCResourceController'
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}/EKSServiceRole'
+  EKSNodeInstanceRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action:
+              - 'sts:AssumeRole'
+            Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+        Version: 2012-10-17
+      ManagedPolicyArns:
+        - !Sub >-
+          arn:${AWS::Partition}:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AmazonEKSWorkerNodePolicy'
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AmazonEKS_CNI_Policy'
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore'
+      Path: /
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}/EKSNodeInstanceRole'  
+  PolicyCloudWatchMetrics:
+    Type: 'AWS::IAM::Policy'
+    Properties:
+      PolicyDocument:
+        Statement:
+          - Action:
+              - 'cloudwatch:PutMetricData'
+            Effect: Allow
+            Resource: '*'
+        Version: 2012-10-17
+      PolicyName: !Sub '${AWS::StackName}-${AWS::Region}-PolicyCloudWatchMetrics'
+      Roles:
+        - !Ref EKSServiceRole
+  PolicyELBPermissions:
+    Type: 'AWS::IAM::Policy'
+    Properties:
+      PolicyDocument:
+        Statement:
+          - Action:
+              - 'ec2:DescribeAccountAttributes'
+              - 'ec2:DescribeAddresses'
+              - 'ec2:DescribeInternetGateways'
+            Effect: Allow
+            Resource: '*'
+        Version: 2012-10-17
+      PolicyName: !Sub '${AWS::StackName}-${AWS::Region}-PolicyELBPermissions'
+      Roles:
+        - !Ref EKSServiceRole
+  PolicyAWSLoadBalancerController:
+    Type: 'AWS::IAM::Policy'
+    Properties:
+      PolicyDocument:
+        Statement:
+          - Action:
+              - 'ec2:CreateTags'
+            Condition:
+              'Null':
+                'aws:RequestTag/elbv2.k8s.aws/cluster': 'false'
+              StringEquals:
+                'ec2:CreateAction': CreateSecurityGroup
+            Effect: Allow
+            Resource: !Sub 'arn:${AWS::Partition}:ec2:*:*:security-group/*'
+          - Action:
+              - 'ec2:CreateTags'
+              - 'ec2:DeleteTags'
+            Condition:
+              'Null':
+                'aws:RequestTag/elbv2.k8s.aws/cluster': 'true'
+                'aws:ResourceTag/elbv2.k8s.aws/cluster': 'false'
+            Effect: Allow
+            Resource: !Sub 'arn:${AWS::Partition}:ec2:*:*:security-group/*'
+          - Action:
+              - 'elasticloadbalancing:CreateLoadBalancer'
+              - 'elasticloadbalancing:CreateTargetGroup'
+            Condition:
+              'Null':
+                'aws:RequestTag/elbv2.k8s.aws/cluster': 'false'
+            Effect: Allow
+            Resource: '*'
+          - Action:
+              - 'elasticloadbalancing:AddTags'
+              - 'elasticloadbalancing:RemoveTags'
+            Condition:
+              'Null':
+                'aws:RequestTag/elbv2.k8s.aws/cluster': 'true'
+                'aws:ResourceTag/elbv2.k8s.aws/cluster': 'false'
+            Effect: Allow
+            Resource:
+              - !Sub 'arn:${AWS::Partition}:elasticloadbalancing:*:*:targetgroup/*/*'
+              - !Sub >-
+                arn:${AWS::Partition}:elasticloadbalancing:*:*:loadbalancer/net/*/*
+              - !Sub >-
+                arn:${AWS::Partition}:elasticloadbalancing:*:*:loadbalancer/app/*/*
+          - Action:
+              - 'elasticloadbalancing:AddTags'
+              - 'elasticloadbalancing:RemoveTags'
+            Effect: Allow
+            Resource:
+              - !Sub >-
+                arn:${AWS::Partition}:elasticloadbalancing:*:*:listener/net/*/*/*
+              - !Sub >-
+                arn:${AWS::Partition}:elasticloadbalancing:*:*:listener/app/*/*/*
+              - !Sub >-
+                arn:${AWS::Partition}:elasticloadbalancing:*:*:listener-rule/net/*/*/*
+              - !Sub >-
+                arn:${AWS::Partition}:elasticloadbalancing:*:*:listener-rule/app/*/*/*
+          - Action:
+              - 'ec2:AuthorizeSecurityGroupIngress'
+              - 'ec2:RevokeSecurityGroupIngress'
+              - 'ec2:DeleteSecurityGroup'
+              - 'elasticloadbalancing:ModifyLoadBalancerAttributes'
+              - 'elasticloadbalancing:SetIpAddressType'
+              - 'elasticloadbalancing:SetSecurityGroups'
+              - 'elasticloadbalancing:SetSubnets'
+              - 'elasticloadbalancing:DeleteLoadBalancer'
+              - 'elasticloadbalancing:ModifyTargetGroup'
+              - 'elasticloadbalancing:ModifyTargetGroupAttributes'
+              - 'elasticloadbalancing:DeleteTargetGroup'
+            Condition:
+              'Null':
+                'aws:ResourceTag/elbv2.k8s.aws/cluster': 'false'
+            Effect: Allow
+            Resource: '*'
+          - Action:
+              - 'elasticloadbalancing:RegisterTargets'
+              - 'elasticloadbalancing:DeregisterTargets'
+            Effect: Allow
+            Resource: !Sub 'arn:${AWS::Partition}:elasticloadbalancing:*:*:targetgroup/*/*'
+          - Action:
+              - 'iam:CreateServiceLinkedRole'
+              - 'ec2:DescribeAccountAttributes'
+              - 'ec2:DescribeAddresses'
+              - 'ec2:DescribeAvailabilityZones'
+              - 'ec2:DescribeInternetGateways'
+              - 'ec2:DescribeVpcs'
+              - 'ec2:DescribeSubnets'
+              - 'ec2:DescribeSecurityGroups'
+              - 'ec2:DescribeInstances'
+              - 'ec2:DescribeNetworkInterfaces'
+              - 'ec2:DescribeTags'
+              - 'ec2:DescribeVpcPeeringConnections'
+              - 'elasticloadbalancing:DescribeLoadBalancers'
+              - 'elasticloadbalancing:DescribeLoadBalancerAttributes'
+              - 'elasticloadbalancing:DescribeListeners'
+              - 'elasticloadbalancing:DescribeListenerCertificates'
+              - 'elasticloadbalancing:DescribeSSLPolicies'
+              - 'elasticloadbalancing:DescribeRules'
+              - 'elasticloadbalancing:DescribeTargetGroups'
+              - 'elasticloadbalancing:DescribeTargetGroupAttributes'
+              - 'elasticloadbalancing:DescribeTargetHealth'
+              - 'elasticloadbalancing:DescribeTags'
+              - 'cognito-idp:DescribeUserPoolClient'
+              - 'acm:ListCertificates'
+              - 'acm:DescribeCertificate'
+              - 'iam:ListServerCertificates'
+              - 'iam:GetServerCertificate'
+              - 'waf-regional:GetWebACL'
+              - 'waf-regional:GetWebACLForResource'
+              - 'waf-regional:AssociateWebACL'
+              - 'waf-regional:DisassociateWebACL'
+              - 'wafv2:GetWebACL'
+              - 'wafv2:GetWebACLForResource'
+              - 'wafv2:AssociateWebACL'
+              - 'wafv2:DisassociateWebACL'
+              - 'shield:GetSubscriptionState'
+              - 'shield:DescribeProtection'
+              - 'shield:CreateProtection'
+              - 'shield:DeleteProtection'
+              - 'ec2:AuthorizeSecurityGroupIngress'
+              - 'ec2:RevokeSecurityGroupIngress'
+              - 'ec2:CreateSecurityGroup'
+              - 'elasticloadbalancing:CreateListener'
+              - 'elasticloadbalancing:DeleteListener'
+              - 'elasticloadbalancing:CreateRule'
+              - 'elasticloadbalancing:DeleteRule'
+              - 'elasticloadbalancing:SetWebAcl'
+              - 'elasticloadbalancing:ModifyListener'
+              - 'elasticloadbalancing:AddListenerCertificates'
+              - 'elasticloadbalancing:RemoveListenerCertificates'
+              - 'elasticloadbalancing:ModifyRule'
+            Effect: Allow
+            Resource: '*'
+        Version: 2012-10-17
+      PolicyName: !Sub '${AWS::StackName}-${AWS::Region}-PolicyAWSLoadBalancerController'
+      Roles:
+        - !Ref EKSNodeInstanceRole
+  PolicyAutoScaling:
+    Type: 'AWS::IAM::Policy'
+    Properties:
+      PolicyDocument:
+        Statement:
+          - Action:
+              - 'autoscaling:DescribeAutoScalingGroups'
+              - 'autoscaling:DescribeAutoScalingInstances'
+              - 'autoscaling:DescribeLaunchConfigurations'
+              - 'autoscaling:DescribeTags'
+              - 'autoscaling:SetDesiredCapacity'
+              - 'autoscaling:TerminateInstanceInAutoScalingGroup'
+              - 'ec2:DescribeInstanceTypes'
+              - 'ec2:DescribeLaunchTemplateVersions'
+            Effect: Allow
+            Resource: '*'
+        Version: 2012-10-17
+      PolicyName: !Sub '${AWS::StackName}-${AWS::Region}-PolicyAutoScaling'
+      Roles:
+        - !Ref EKSNodeInstanceRole
+  PolicyEBS:
+    Type: 'AWS::IAM::Policy'
+    Properties:
+      PolicyDocument:
+        Statement:
+          - Action:
+              - 'ec2:CreateSnapshot'
+              - 'ec2:AttachVolume'
+              - 'ec2:DetachVolume'
+              - 'ec2:ModifyVolume'
+              - 'ec2:DescribeAvailabilityZones'
+              - 'ec2:DescribeInstances'
+              - 'ec2:DescribeSnapshots'
+              - 'ec2:DescribeTags'
+              - 'ec2:DescribeVolumes'
+              - 'ec2:DescribeVolumesModifications'
+            Effect: Allow
+            Resource: '*'
+          - Action:
+              - 'ec2:CreateTags'
+            Condition:
+              StringEquals:
+                'ec2:CreateAction':
+                  - CreateVolume
+                  - CreateSnapshot
+            Effect: Allow
+            Resource:
+              - !Sub 'arn:${AWS::Partition}:ec2:*:*:volume/*'
+              - !Sub 'arn:${AWS::Partition}:ec2:*:*:snapshot/*'
+          - Action:
+              - 'ec2:DeleteTags'
+            Effect: Allow
+            Resource:
+              - !Sub 'arn:${AWS::Partition}:ec2:*:*:volume/*'
+              - !Sub 'arn:${AWS::Partition}:ec2:*:*:snapshot/*'
+          - Action:
+              - 'ec2:CreateVolume'
+            Condition:
+              StringLike:
+                'aws:RequestTag/ebs.csi.aws.com/cluster': 'true'
+            Effect: Allow
+            Resource: '*'
+          - Action:
+              - 'ec2:CreateVolume'
+            Condition:
+              StringLike:
+                'aws:RequestTag/CSIVolumeName': '*'
+            Effect: Allow
+            Resource: '*'
+          - Action:
+              - 'ec2:CreateVolume'
+            Condition:
+              StringLike:
+                'aws:RequestTag/kubernetes.io/cluster/*': owned
+            Effect: Allow
+            Resource: '*'
+          - Action:
+              - 'ec2:DeleteVolume'
+            Condition:
+              StringLike:
+                'ec2:ResourceTag/ebs.csi.aws.com/cluster': 'true'
+            Effect: Allow
+            Resource: '*'
+          - Action:
+              - 'ec2:DeleteVolume'
+            Condition:
+              StringLike:
+                'ec2:ResourceTag/CSIVolumeName': '*'
+            Effect: Allow
+            Resource: '*'
+          - Action:
+              - 'ec2:DeleteVolume'
+            Condition:
+              StringLike:
+                'ec2:ResourceTag/kubernetes.io/cluster/*': owned
+            Effect: Allow
+            Resource: '*'
+          - Action:
+              - 'ec2:DeleteSnapshot'
+            Condition:
+              StringLike:
+                'ec2:ResourceTag/CSIVolumeSnapshotName': '*'
+            Effect: Allow
+            Resource: '*'
+          - Action:
+              - 'ec2:DeleteSnapshot'
+            Condition:
+              StringLike:
+                'ec2:ResourceTag/ebs.csi.aws.com/cluster': 'true'
+            Effect: Allow
+            Resource: '*'
+        Version: 2012-10-17
+      PolicyName: !Sub '${AWS::StackName}-${AWS::Region}-PolicyEBS'
+      Roles:
+        - !Ref EKSNodeInstanceRole
+Outputs:
+  JenkinsInstanceProfile:
+    Description: IAM Instance Profile for Jenkins Instances
+    Value: !Sub '${JenkinsInstanceProfile.Arn}'
+  JenkinsInstanceRole:
+    Description: IAM Role for Jenkins Instances IAM EC2 Profile
+    Value: !Sub '${JenkinsInstanceRole.Arn}'
+  JenkinsAgentRole:
+    Description: IAM Role for Jenkins Instance profile
+    Value: !Sub '${JenkinsAgentRole.Arn}'
+  JenkinsAgentInstanceProfile:
+    Description: IAM instance profile for Jenkins Agent
+    Value: !Sub '${JenkinsAgentProfile.Arn}'
+  EKSServiceRoleArn:
+    Description: EKS service Role
+    Value: !Sub '${EKSServiceRole.Arn}'
+  EKSNodeInstanceRole:
+    Description: IAM Role for EKS Managed Nodes Group
+    Value: !Sub '${EKSNodeInstanceRole.Arn}'
